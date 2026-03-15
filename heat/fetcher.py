@@ -349,6 +349,37 @@ def fetch_hot_rank_latest_em(symbol: str) -> dict | None:
         return None
 
 
+def fetch_hot_search_baidu(market: str = "A股", time: str = "今日",
+                           date: str = None) -> list[dict]:
+    """百度热搜 Top12（24小时资讯）
+
+    market: A股/港股/美股
+    time: 今日/1小时
+    date: YYYYMMDD 格式，默认今天
+    """
+    if date is None:
+        date = datetime.now().strftime("%Y%m%d")
+    try:
+        df = ak.stock_hot_search_baidu(symbol=market, time=time, date=date)
+        if df is None or df.empty:
+            return []
+        results = []
+        for rank_idx, (_, row) in enumerate(df.iterrows(), start=1):
+            results.append({
+                "date": datetime.strptime(date, "%Y%m%d").date(),
+                "market": market,
+                "rank": rank_idx,
+                "stock_name": str(row.get("名称/代码", "")).strip(),
+                "change_rate": str(row.get("涨跌幅", "")),
+                "heat": _safe_int(row.get("综合热度")),
+            })
+        logger.info(f"[百度热搜] {market} {time} {date}：{len(results)} 条")
+        return results
+    except Exception as e:
+        logger.warning(f"[百度热搜] {market} {time} {date} 失败: {e}")
+        return []
+
+
 def fetch_hot_rank_relate_em(symbol: str) -> list[dict]:
     """东方财富-个股相关股票（备用）"""
     try:

@@ -20,18 +20,19 @@ python -m heat.main
 # 热门关键词（Top100，必须先跑人气排名）
 python -m heat.main --keyword
 
+# 百度热搜（A股+港股+美股 Top12，24小时资讯）
+python -m heat.main --baidu
+
 # 热度回溯（366天历史趋势，仅首次）
 python -m heat.main --init
 
-# 新闻采集（单次）
-python -m news.main --once
+# 24小时全球资讯
+python -m news.main --global
 
-# 新闻采集（定时调度）
+# 个股资讯
 python -m news.main
-
-# 新闻采集（指定股票/板块）
-python -m news.main --once --stocks 600519,000858
-python -m news.main --once --category news
+python -m news.main --stocks 600519,000858
+python -m news.main --category news
 
 # 分析（待实现）
 python -m analysis.main

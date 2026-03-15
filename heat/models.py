@@ -183,3 +183,24 @@ class XqHotRank(Base):
         Index("idx_xqhr_date", "date"),
         Index("idx_xqhr_type", "type"),
     )
+
+
+class BaiduHotSearch(Base):
+    """百度热搜排行（24小时资讯，A股/港股/美股 Top12）"""
+    __tablename__ = "baidu_hot_search"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(Date, nullable=False, comment="采集日期")
+    market = Column(String(10), nullable=False, comment="市场: A股/港股/美股")
+    rank = Column(Integer, nullable=False, comment="热搜排名 1-12")
+    stock_name = Column(String(50), nullable=False, comment="股票名称")
+    change_rate = Column(String(20), comment="涨跌幅（原始字符串，如 +0.45%）")
+    heat = Column(Integer, comment="综合热度")
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint("date", "market", "rank",
+                         name="uq_bhs_date_market_rank"),
+        Index("idx_bhs_date", "date"),
+        Index("idx_bhs_market", "market"),
+    )

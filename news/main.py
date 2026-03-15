@@ -1,10 +1,11 @@
 """新闻采集调度层 —— 1s 间隔限流
 
 用法：
-  python -m news.main --once                    # 单次采集
-  python -m news.main --once --stocks 600519    # 指定股票
-  python -m news.main --once --category news    # 指定板块
-  python -m news.main                           # 定时调度
+  python -m news.main                           # 个股资讯（默认）
+  python -m news.main --stocks 600519           # 指定股票
+  python -m news.main --category news           # 指定板块
+  python -m news.main --all-stocks              # 全部股票（不分批）
+  python -m news.main --global                  # 24小时全球资讯
 """
 
 import argparse
@@ -15,11 +16,12 @@ from datetime import datetime, timedelta
 
 from config import load_config, load_stocks, AppConfig, StockInfo
 from database import Database, batch_insert_ignore
-from news.models import Article
+from news.models import Article, GlobalNews
 from news.fetcher import (
     fetch_source, fetch_google_news, fetch_stock_eastmoney,
     fetch_stock_sina, extract_full_text,
     generate_stock_queries, dedup_articles, RawArticle,
+    fetch_global_news_em,
 )
 
 logging.basicConfig(
@@ -152,44 +154,47 @@ def run_pipeline(cfg: AppConfig, db: Database, all_stocks: list[StockInfo]):
     logger.info(f"========== 新闻采集完成：新增 {new_count} 篇 ==========")
 
 
+def run_global(db: Database):
+    """采集24小时全球资讯（东方财富 stock_info_global_em）"""
+    logger.info("========== 24小时资讯采集开始 ==========")
+    session = db.get_session()
+
+    rows = fetch_global_news_em()
+    if rows:
+        new_count = batch_insert_ignore(session, GlobalNews, rows)
+        logger.info(f"========== 24小时资讯完成：采集 {len(rows)} 条，新增 {new_count} 条 ==========")
+    else:
+        logger.warning("========== 24小时资讯：未采集到数据 ==========")
+
+    session.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="新闻采集")
     parser.add_argument("-c", "--config", default=None)
-    parser.add_argument("--once", action="store_true", help="只执行一次")
     parser.add_argument("--category", choices=["news", "finance", "forum", "stock"])
     parser.add_argument("--stocks", type=str, default=None)
     parser.add_argument("--all-stocks", action="store_true")
+    parser.add_argument("--global", dest="global_news", action="store_true",
+                        help="24小时全球资讯")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-
-    if args.category:
-        cfg.sources = [s for s in cfg.sources if s.category == args.category]
-        logger.info(f"筛选板块: {args.category}，共 {len(cfg.sources)} 个数据源")
-
-    all_stocks = load_stocks(cfg, args.stocks)
-    if args.once and args.all_stocks and all_stocks:
-        cfg.scheduler.stocks_per_run = len(all_stocks)
-
     db = Database(cfg.database)
     db.init_tables()
 
-    if args.once:
-        run_pipeline(cfg, db, all_stocks)
+    if args.global_news:
+        run_global(db)
     else:
-        from apscheduler.schedulers.blocking import BlockingScheduler
-        scheduler = BlockingScheduler()
-        scheduler.add_job(
-            run_pipeline, "interval",
-            args=[cfg, db, all_stocks],
-            minutes=cfg.scheduler.interval_minutes,
-            next_run_time=datetime.now(),
-        )
-        logger.info(f"定时调度已启动，每 {cfg.scheduler.interval_minutes} 分钟")
-        try:
-            scheduler.start()
-        except (KeyboardInterrupt, SystemExit):
-            logger.info("调度器已停止")
+        if args.category:
+            cfg.sources = [s for s in cfg.sources if s.category == args.category]
+            logger.info(f"筛选板块: {args.category}，共 {len(cfg.sources)} 个数据源")
+
+        all_stocks = load_stocks(cfg, args.stocks)
+        if args.all_stocks and all_stocks:
+            cfg.scheduler.stocks_per_run = len(all_stocks)
+
+        run_pipeline(cfg, db, all_stocks)
 
 
 if __name__ == "__main__":

@@ -272,6 +272,40 @@ def fetch_stock_sina(query: str, network: NetworkConfig) -> list[RawArticle]:
     return fetch_sina_api(source, network)
 
 
+def fetch_global_news_em() -> list[dict]:
+    """东方财富24小时全球资讯（stock_info_global_em），返回 ~200 条"""
+    import akshare as ak
+    import hashlib
+    try:
+        df = ak.stock_info_global_em()
+        if df is None or df.empty:
+            return []
+        results = []
+        for _, row in df.iterrows():
+            url = str(row.get("链接", "")).strip()
+            if not url:
+                continue
+            pub_time = None
+            pub_str = str(row.get("发布时间", "")).strip()
+            if pub_str:
+                try:
+                    pub_time = datetime.strptime(pub_str, "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+            results.append({
+                "title": str(row.get("标题", "")).strip(),
+                "summary": str(row.get("摘要", "")).strip()[:5000],
+                "url": url,
+                "url_hash": hashlib.sha256(url.encode()).hexdigest(),
+                "published_at": pub_time,
+            })
+        logger.info(f"[24小时资讯] 获取 {len(results)} 条")
+        return results
+    except Exception as e:
+        logger.error(f"[24小时资讯] 采集失败: {e}")
+        return []
+
+
 def generate_stock_queries(stock: StockInfo) -> list[str]:
     """股票代码 + 公司名，各搜一次"""
     queries = [stock.code]

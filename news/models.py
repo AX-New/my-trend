@@ -33,3 +33,21 @@ class Article(Base):
 
     def __repr__(self):
         return f"<Article {self.id}: {self.title[:30]}>"
+
+
+class GlobalNews(Base):
+    """24小时全球资讯（东方财富 stock_info_global_em）"""
+    __tablename__ = "global_news"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(500), nullable=False, comment="标题")
+    summary = Column(Text, comment="摘要")
+    url = Column(String(2048), nullable=False, comment="原文链接")
+    url_hash = Column(String(64), nullable=False, comment="url 的 SHA256，用于唯一去重")
+    published_at = Column(DateTime, comment="发布时间")
+    created_at = Column(DateTime, default=datetime.now, comment="入库时间")
+
+    __table_args__ = (
+        UniqueConstraint("url_hash", name="uq_global_news_url_hash"),
+        Index("idx_gn_published", "published_at"),
+    )
