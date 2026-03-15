@@ -1,0 +1,138 @@
+# my-trend 金融舆情分析配置
+# 复制为 config.yaml 并填写实际值
+
+database:
+  host: localhost
+  port: 3306
+  user: root
+  password: "your_password"
+  db: my_trend
+  charset: utf8mb4
+
+# LLM 配置
+llm:
+  base_url: "https://your-llm-api/v1"
+  api_key: "your_api_key"
+  model: "your_model"
+  max_tokens: 1024
+  temperature: 0.3
+
+# ============================================================
+# 数据源配置，按板块分类：
+#   news    - 新闻门户（综合类新闻媒体）
+#   finance - 财经门户（专业财经媒体）
+#   forum   - 论坛情报（社区讨论、投资者交流）
+#   stock   - 个股情报（个股相关新闻、公告、研报）
+# ============================================================
+sources:
+
+  # ---------- 新闻门户 ----------
+  - name: "Reuters"
+    category: "news"
+    url: "https://feeds.reuters.com/reuters/businessNews"
+    language: "en"
+    enabled: true
+
+  - name: "BBC Business"
+    category: "news"
+    url: "http://feeds.bbci.co.uk/news/business/rss.xml"
+    language: "en"
+    enabled: true
+
+  - name: "新华网财经"
+    category: "news"
+    url: "http://www.xinhuanet.com/fortune/news_fortune.xml"
+    language: "zh"
+    enabled: true
+
+  # ---------- 财经门户 ----------
+  - name: "CNBC Finance"
+    category: "finance"
+    url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"
+    language: "en"
+    enabled: true
+
+  - name: "新浪财经"
+    category: "finance"
+    url: "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&num=20&page=1"
+    language: "zh"
+    type: "json_api"
+    enabled: true
+
+  - name: "36Kr"
+    category: "finance"
+    url: "https://36kr.com/feed"
+    language: "zh"
+    enabled: true
+
+  - name: "WSJ Markets"
+    category: "finance"
+    url: "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"
+    language: "en"
+    enabled: false
+
+  # ---------- 论坛情报 ----------
+  - name: "雪球热帖"
+    category: "forum"
+    url: "https://xueqiu.com/statuses/hot/listV2.json?since_id=-1&max_id=-1&size=20"
+    language: "zh"
+    type: "json_api"
+    enabled: false
+
+  - name: "东方财富股吧"
+    category: "forum"
+    url: "https://guba.eastmoney.com"
+    language: "zh"
+    type: "json_api"
+    enabled: false
+
+  - name: "Reddit WallStreetBets"
+    category: "forum"
+    url: "https://www.reddit.com/r/wallstreetbets/.rss"
+    language: "en"
+    enabled: false
+
+  # ---------- 个股情报 ----------
+  - name: "新浪个股新闻"
+    category: "stock"
+    url: "https://feed.mix.sina.com.cn/api/roll/get?pageid=155&lid=2520&num=20&page=1"
+    language: "zh"
+    type: "json_api"
+    enabled: false
+
+  - name: "东方财富个股资讯"
+    category: "stock"
+    url: "https://www.eastmoney.com"
+    language: "zh"
+    type: "json_api"
+    enabled: false
+
+# 股票代码文件（每行一个代码，支持 # 注释）
+stocks_file: "stocks.txt"
+
+# 或直接写少量代码（stocks_file 优先）
+stocks: []
+
+# 调度配置
+scheduler:
+  interval_minutes: 15       # 每 15 分钟一轮
+  max_articles_per_run: 500  # 单轮入库上限
+  stocks_per_run: 10         # 每轮处理几只股票
+  max_workers: 5             # 并发线程数
+
+# 人气排名配置
+popularity:
+  enabled: true
+  page_size: 50
+
+# AkShare 热度数据配置
+akshare:
+  enabled: true
+  detail_source: "rank_top"  # rank_top=从人气榜Top100取个股详情 / stocks_file=从stocks.txt取
+  detail_top_n: 20           # detail_source=rank_top 时取前 N 只做单股接口采集
+
+# 网络配置
+network:
+  timeout: 30
+  proxy: ""  # 需要时填写，如 http://localhost:7890
+  user_agent: "my-trend/1.0"
