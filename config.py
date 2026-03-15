@@ -1,8 +1,12 @@
 """配置加载模块，从 config.yaml 读取所有配置项"""
 
+import logging
+import re
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -101,7 +105,6 @@ def load_config(path: str = None) -> AppConfig:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
-    # 逐块解析，缺失的用默认值
     db_raw = raw.get("database", {})
     llm_raw = raw.get("llm", {})
     scheduler_raw = raw.get("scheduler", {})
@@ -128,3 +131,37 @@ def load_config(path: str = None) -> AppConfig:
         popularity=PopularityConfig(**popularity_raw),
         akshare=AkshareConfig(**akshare_raw),
     )
+
+
+def load_stocks(cfg: AppConfig, cli_stocks: str = None) -> list[StockInfo]:
+    """加载股票列表，从 stocks.txt 解析代码、名称、行业"""
+    if cli_stocks:
+        return [StockInfo(code=c.strip()) for c in cli_stocks.split(",") if c.strip()]
+
+    if cfg.stocks_file:
+        path = Path(cfg.stocks_file)
+        if not path.is_absolute():
+            path = Path(__file__).parent / path
+        if path.exists():
+            stocks = []
+            current_industry = ""
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.match(r'^#\s*──\s*(.+?)\s*──', line)
+                if m:
+                    current_industry = m.group(1)
+                    continue
+                parts = line.split("#", 1)
+                code = parts[0].strip()
+                name = parts[1].strip() if len(parts) > 1 else ""
+                if code:
+                    stocks.append(StockInfo(
+                        code=code, name=name, industry=current_industry,
+                    ))
+            logger.info(f"从 {path} 加载 {len(stocks)} 只股票")
+            return stocks
+        logger.warning(f"股票文件不存在: {path}")
+
+    return [StockInfo(code=c) for c in (cfg.stocks or [])]

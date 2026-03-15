@@ -2,6 +2,11 @@
 
 > 状态: 进行中 | 创建: 2026-03-14 | 更新: 2026-03-15
 
+### 最新进展
+- ✅ **接口精简**（2026-03-15）：main.py pipeline 已停用 8 个冗余 AkShare 接口，monitor.py 只保留 --init 回溯。代码和数据库表保留备用，仅执行层面精简。
+- ✅ **写入改造**（2026-03-15）：全部写入改为无事务设计。batch_upsert / batch_insert_ignore，Article 新增 url_hash 唯一约束。
+- ✅ **包拆分**（2026-03-15）：拆为 heat/news/guba/analysis 四个独立包，各自带 models+main。能力层（fetcher）无限流，调度层（main）1s 间隔。删除根目录 main.py/fetcher.py/akshare_fetcher.py/analyzer.py/models.py/monitor.py。
+
 ## 架构定位
 
 两条核心数据线 + 一条补充线：
@@ -85,12 +90,17 @@ em_hot_rank_detail（历史趋势，init 时一次性回溯）
 
 | 文件 | 职责 |
 |------|------|
-| `main.py` | 主 pipeline：清理→数据源→人气排名→AkShare→个股新闻→入库 |
-| `monitor.py` | 热度监控独立脚本（`--init` 回溯历史趋势） |
-| `akshare_fetcher.py` | AkShare 10 接口采集（重点用 detail_em，其余备用） |
-| `fetcher.py` | RSS/API 新闻 + 人气排名(选股API)采集 |
-| `models.py` | 全部数据表（PopularityRank + AkShare 8 张 + Article/StockDaily） |
-| `config.py` | 配置加载（含 AkshareConfig） |
+| `database.py` | 共享 Base + Database + batch_upsert/insert_ignore |
+| `config.py` | 共享配置 + load_stocks |
 | `config.yaml` | 所有配置项 |
-| `analyzer.py` | LLM 分析（备用） |
 | `stocks.txt` | 自选股列表（代码+名称+行业） |
+| `heat/fetcher.py` | 能力层：popularity_page + akshare 10 接口（无限流） |
+| `heat/models.py` | PopularityRank + AkShare 8 张表 |
+| `heat/main.py` | 调度层：人气排名分页 + --init 历史回溯（1s 间隔） |
+| `news/fetcher.py` | 能力层：RSS/GoogleNews/东方财富/新浪（无限流） |
+| `news/models.py` | Article（url_hash 唯一去重） |
+| `news/main.py` | 调度层：数据源 + 个股新闻 + 正文提取（1s 间隔） |
+| `analysis/analyzer.py` | 能力层：LLM 单篇/批量分析 |
+| `analysis/models.py` | StockDaily |
+| `analysis/main.py` | 调度层（待实现） |
+| `guba/` | 股吧情绪采样（待实现） |
