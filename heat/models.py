@@ -112,12 +112,12 @@ class EmHotRankRealtime(Base):
 
 
 class EmHotKeyword(Base):
-    """东方财富个股热门关键词（备用）"""
+    """东方财富个股热门关键词"""
     __tablename__ = "em_hot_keyword"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     stock_code = Column(String(20), nullable=False)
-    timestamp = Column(DateTime, nullable=False)
+    timestamp = Column(DateTime, nullable=False, comment="数据时间")
     concept_name = Column(String(100))
     concept_code = Column(String(50))
     heat = Column(Float)

@@ -312,7 +312,7 @@ def fetch_hot_rank_realtime_em(symbol: str) -> list[dict]:
 
 
 def fetch_hot_keyword_em(symbol: str) -> list[dict]:
-    """东方财富-个股热门关键词（备用）"""
+    """东方财富-个股热门关键词"""
     try:
         df = ak.stock_hot_keyword_em(symbol=symbol)
         if df is None or df.empty:

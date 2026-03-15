@@ -17,6 +17,9 @@
 # 热度采集（人气排名，全市场 ~5500 只）
 python -m heat.main
 
+# 热门关键词（Top100，必须先跑人气排名）
+python -m heat.main --keyword
+
 # 热度回溯（366天历史趋势，仅首次）
 python -m heat.main --init
 
@@ -33,6 +36,11 @@ python -m news.main --once --category news
 # 分析（待实现）
 python -m analysis.main
 ```
+
+### 执行顺序约束
+
+- **heat 日常必须串行**：`heat.main` → `heat.main --keyword`，关键词依赖当日人气排名 Top100，不可并行
+- `--init` 仅首次运行，独立执行即可
 
 ## Architecture
 
