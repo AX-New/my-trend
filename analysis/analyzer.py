@@ -32,11 +32,13 @@ def _parse_date_str(date_str: str) -> datetime | None:
     # X分钟前
     m = re.search(r'(\d+)\s*分钟前', date_str)
     if m:
-        return now - timedelta(minutes=int(m.group(1)))
+        minutes = min(int(m.group(1)), 5256000)  # 防溢出，最多10年
+        return now - timedelta(minutes=minutes)
     # X小时前
     m = re.search(r'(\d+)\s*小时前', date_str)
     if m:
-        return now - timedelta(hours=int(m.group(1)))
+        hours = min(int(m.group(1)), 87600)  # 防溢出，最多10年
+        return now - timedelta(hours=hours)
     # X天前
     m = re.search(r'(\d+)\s*天前', date_str)
     if m:
