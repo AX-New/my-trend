@@ -40,7 +40,7 @@ logger = logging.getLogger("analysis")
 DELAY = 5
 MAX_LLM_WORKERS = 3
 # 连续搜索失败退避：连续 N 只无新闻则暂停，避免被限流
-EMPTY_STREAK_THRESHOLD = 5   # 连续空结果触发退避
+EMPTY_STREAK_THRESHOLD = 2   # 连续空结果触发退避
 BACKOFF_SECONDS = 300        # 退避时长（秒）
 
 # 来源标识：用主机名区分不同机器

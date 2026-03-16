@@ -10,17 +10,21 @@ import logging
 from datetime import datetime
 
 import akshare as ak
-import httpx
 import pandas as pd
+from curl_cffi import requests as cffi_req
 
 from config import NetworkConfig
 
 logger = logging.getLogger(__name__)
 
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+_session: cffi_req.Session | None = None
+
+
+def _get_session() -> cffi_req.Session:
+    global _session
+    if _session is None:
+        _session = cffi_req.Session(impersonate="chrome120")
+    return _session
 
 
 # ── 工具函数 ──
@@ -100,14 +104,9 @@ def fetch_popularity_page(network: NetworkConfig, filter_str: str,
         f"&filter={filter_str}"
         "&source=SELECT_SECURITIES&client=WEB&hyversion=v2"
     )
-    with httpx.Client(
-        timeout=network.timeout,
-        follow_redirects=True,
-        headers={"User-Agent": _BROWSER_UA},
-    ) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-        return resp.json()
+    resp = _get_session().get(url, timeout=network.timeout)
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ── AkShare 接口 ──
