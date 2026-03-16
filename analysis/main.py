@@ -15,6 +15,8 @@
 import argparse
 import json
 import logging
+import logging.handlers
+from pathlib import Path
 import platform
 import threading
 import time
@@ -30,18 +32,24 @@ from analysis.analyzer import (
     _collect_news, _call_llm, STOCK_PROMPT, LLMConfig,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+_LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+
+_log_fmt = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+_console = logging.StreamHandler()
+_console.setFormatter(_log_fmt)
+_file = logging.handlers.RotatingFileHandler(
+    _LOG_DIR / "analysis.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
+)
+_file.setFormatter(_log_fmt)
+logging.basicConfig(level=logging.INFO, handlers=[_console, _file])
 logger = logging.getLogger("analysis")
 
 DELAY = 5
 MAX_LLM_WORKERS = 3
-# 连续搜索失败退避：连续 N 只无新闻则暂停，避免被限流
-EMPTY_STREAK_THRESHOLD = 2   # 连续空结果触发退避
-BACKOFF_SECONDS = 300        # 退避时长（秒）
 
 # 来源标识：用主机名区分不同机器
 _SOURCE = platform.node()[:50]
@@ -257,8 +265,22 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
     semaphore = threading.Semaphore(MAX_LLM_WORKERS)
     executor = ThreadPoolExecutor(max_workers=MAX_LLM_WORKERS, thread_name_prefix="worker")
     futures = {}
-    empty_streak = 0  # 连续搜索无结果计数
-    stopped_early = False  # 是否因限流等原因提前退出
+    stopped_early = False
+    # 游标管理：记录每个位置是否完成，按顺序推进
+    done_flags = {}  # {位置索引: True}
+    cursor_lock = threading.Lock()
+
+    def _try_advance_cursor():
+        """推进游标到连续完成的最大位置"""
+        if not run:
+            return
+        with cursor_lock:
+            cursor = run.done_cursor
+            while (cursor - base_cursor) in done_flags:
+                del done_flags[cursor - base_cursor]
+                cursor += 1
+            if cursor > run.done_cursor:
+                _advance_cursor(session, run, cursor)
 
     for i, (code, name) in enumerate(codes_names):
         global_i = base_cursor + i + 1
@@ -268,44 +290,41 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
         articles = _collect_news(queries, max_count=40)
 
         if articles:
-            empty_streak = 0
             article_count = len(articles.strip().split("\n\n"))
             prompt = STOCK_PROMPT.format(
                 code=code, name=name, articles=articles, today=date.today(),
             )
             semaphore.acquire()
             fut = executor.submit(_llm_task, code, name, prompt, article_count, llm, semaphore)
-            futures[fut] = (code, name)
+            futures[fut] = (code, name, i)
             logger.info(f"[{code}] 新闻 {article_count} 条，已提交 LLM")
         else:
-            empty_streak += 1
-            logger.warning(f"[{code}] 无新闻（连续空 {empty_streak}）")
+            # 搜索无结果也算完成（不需要 LLM）
+            logger.warning(f"[{code}] 全部搜索源无结果，退出等待 watchdog 拉起")
             if run:
                 _record_failure(session, run_id, code, name, "搜索无结果")
                 _inc_fail(session, run)
-
-            # 连续空结果：疑似被限流，停止搜索，等下次续跑
-            if empty_streak >= EMPTY_STREAK_THRESHOLD:
-                logger.warning(
-                    f"连续 {empty_streak} 只无新闻，疑似限流，停止搜索"
-                )
-                stopped_early = True
-                break
-
-        # 推进游标：这只已搜索完（LLM 异步处理）
-        if run:
-            _advance_cursor(session, run, base_cursor + i + 1)
+                done_flags[i] = True
+                _try_advance_cursor()
+            stopped_early = True
+            break
 
         time.sleep(DELAY)
 
-        # 收割已完成的 future
+        # 收割已完成的 future，标记完成并推进游标
         for fut in [f for f in futures if f.done()]:
-            _handle_result(session, fut, futures.pop(fut), run_id, run)
+            code_f, name_f, idx = futures.pop(fut)
+            _handle_result(session, fut, (code_f, name_f), run_id, run)
+            done_flags[idx] = True
+        _try_advance_cursor()
 
     # 等待剩余 LLM 任务完成
     logger.info(f"搜索完毕，等待 {len(futures)} 个 LLM 任务完成...")
     for fut in as_completed(futures):
-        _handle_result(session, fut, futures[fut], run_id, run)
+        code_f, name_f, idx = futures[fut]
+        _handle_result(session, fut, (code_f, name_f), run_id, run)
+        done_flags[idx] = True
+        _try_advance_cursor()
 
     executor.shutdown(wait=False)
 

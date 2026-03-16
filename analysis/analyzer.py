@@ -76,21 +76,28 @@ def _parse_date_str(date_str: str) -> datetime | None:
 
 # ── 搜索引擎：今日头条 ──
 
-_session: cffi_req.Session | None = None
+CLASH_PROXY = "http://127.0.0.1:7890"
+
+_session_direct: cffi_req.Session | None = None
+_session_proxy: cffi_req.Session | None = None
 
 
-def _get_session() -> cffi_req.Session:
-    global _session
-    if _session is None:
-        # 不走系统代理，直连访问国内站点
-        _session = cffi_req.Session(impersonate="chrome120", proxy="")
-    return _session
+def _get_session(use_proxy: bool = False) -> cffi_req.Session:
+    global _session_direct, _session_proxy
+    if use_proxy:
+        if _session_proxy is None:
+            _session_proxy = cffi_req.Session(impersonate="chrome120", proxy=CLASH_PROXY)
+        return _session_proxy
+    else:
+        if _session_direct is None:
+            _session_direct = cffi_req.Session(impersonate="chrome120", proxy="")
+        return _session_direct
 
 
-def _search_toutiao(query: str, timeout: int = 15) -> list[dict]:
+def _search_toutiao(query: str, timeout: int = 15, use_proxy: bool = False) -> list[dict]:
     """头条搜索，返回 [{"title": ..., "summary": ..., "date_str": ..., "date": ...}, ...]"""
     try:
-        session = _get_session()
+        session = _get_session(use_proxy)
         resp = session.get(
             "https://so.toutiao.com/search",
             params={"keyword": query, "pd": "information", "dvpf": "pc", "count": 20},
@@ -134,10 +141,48 @@ def _search_toutiao(query: str, timeout: int = 15) -> list[dict]:
     return results
 
 
-def _search(query: str, timeout: int = 15) -> list[dict]:
+def _search_baidu(query: str, timeout: int = 15) -> list[dict]:
+    """百度资讯搜索（降级备用）"""
+    try:
+        session = _get_session(use_proxy=False)
+        resp = session.get(
+            "https://www.baidu.com/s",
+            params={"wd": query, "tn": "news", "rtt": 1, "bsst": 1},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"[百度-{query}] 失败: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results = []
+    for item in soup.select(".result-op, .result"):
+        a = item.select_one("h3 a")
+        if not a:
+            continue
+        title = a.get_text(strip=True)
+        summary_el = item.select_one(".c-summary, .c-abstract, .content-right_8Zs40")
+        summary = summary_el.get_text(strip=True) if summary_el else ""
+
+        date_str = ""
+        time_el = item.select_one(".c-color-gray, .c-color-gray2, .news-source span")
+        if time_el:
+            date_str = time_el.get_text(strip=True)
+
+        results.append({
+            "title": title,
+            "summary": summary[:200],
+            "date_str": date_str,
+            "date": _parse_date_str(date_str),
+        })
+    return results
+
+
+def _search(query: str, timeout: int = 15, use_proxy: bool = False) -> list[dict]:
     """搜索新闻：今日头条"""
-    results = _search_toutiao(query, timeout)
-    logger.info(f"[头条-{query}] {len(results)} 条")
+    results = _search_toutiao(query, timeout, use_proxy)
+    logger.info(f"[头条-{query}] {len(results)} 条{' (代理)' if use_proxy else ''}")
     return results
 
 
@@ -168,33 +213,49 @@ def _format_news(items: list[dict], max_count: int = 30) -> str:
     return "\n\n".join(lines)
 
 
-def _collect_news(queries: list[str], max_count: int = 30,
-                   max_retries: int = 3) -> str:
-    """多关键词搜索 → 去重 → 按时间排序 → 拼接文本（空结果重试+递增退避）"""
+_current_proxy = False  # 当前主力 IP：False=直连，True=代理
+
+
+def _collect_news(queries: list[str], max_count: int = 30) -> str:
+    """多关键词搜索，三级降级：直连/代理头条 → 百度。主力空了切另一个，都空试百度。
+    一旦降级百度就固定使用百度，百度也失败则停止。"""
+    global _current_proxy
     all_news = []
-    consecutive_empty = 0
+    use_baidu = False  # 一旦降级百度就固定
     for q in queries:
-        results = []
-        for attempt in range(1, max_retries + 1):
-            results = _search(q)
-            if results:
-                break
-            wait = random.uniform(DELAY_MIN, DELAY_MAX) * (1 + attempt)
-            logger.info(f"[{q}] 空结果（第{attempt}次），退避 {wait:.0f}s")
-            time.sleep(wait)
-        all_news.extend(results)
-        if results:
-            consecutive_empty = 0
+        if use_baidu:
+            # 已降级百度，固定使用百度
+            results = _search_baidu(q)
+            logger.info(f"[百度-{q}] {len(results)} 条")
+            if not results:
+                # 百度也空，返空，由调用方退出
+                return ""
         else:
-            consecutive_empty += 1
-            if consecutive_empty >= 2:
-                logger.warning(f"连续 {consecutive_empty} 个关键词为空，疑似限流，中断搜索")
-                break
+            # 1. 主力 IP 搜头条
+            results = _search(q, use_proxy=_current_proxy)
+            if not results:
+                # 2. 切到另一个 IP 搜头条，先等待正常间隔
+                _current_proxy = not _current_proxy
+                logger.info(f"切换到{'代理' if _current_proxy else '直连'}，等待后重试...")
+                time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                results = _search(q, use_proxy=_current_proxy)
+            if not results:
+                # 3. 头条双 IP 都空，降级百度（后续固定百度）
+                logger.info(f"头条双 IP 均空，降级百度搜索（后续固定百度）")
+                use_baidu = True
+                time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                results = _search_baidu(q)
+                logger.info(f"[百度-{q}] {len(results)} 条")
+                if not results:
+                    # 百度也空，返空，由调用方退出
+                    return ""
+        all_news.extend(results)
         time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
     unique = _dedup_news(all_news)
     unique = _sort_by_date(unique)
-    logger.info(f"去重后 {len(unique)} 条，取前 {min(len(unique), max_count)} 条")
+    if unique:
+        logger.info(f"去重后 {len(unique)} 条，取前 {min(len(unique), max_count)} 条")
     return _format_news(unique, max_count)
 
 
