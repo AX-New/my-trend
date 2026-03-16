@@ -214,16 +214,16 @@ def _format_news(items: list[dict], max_count: int = 30) -> str:
 
 
 _current_proxy = False  # 当前主力 IP：False=直连，True=代理
+_use_baidu = False      # 一旦降级百度就固定，跨调用保持
 
 
 def _collect_news(queries: list[str], max_count: int = 30) -> str:
     """多关键词搜索，三级降级：直连/代理头条 → 百度。主力空了切另一个，都空试百度。
-    一旦降级百度就固定使用百度，百度也失败则停止。"""
-    global _current_proxy
+    一旦降级百度就固定使用百度（跨调用保持），百度也失败则停止。"""
+    global _current_proxy, _use_baidu
     all_news = []
-    use_baidu = False  # 一旦降级百度就固定
     for q in queries:
-        if use_baidu:
+        if _use_baidu:
             # 已降级百度，固定使用百度
             results = _search_baidu(q)
             logger.info(f"[百度-{q}] {len(results)} 条")
@@ -242,7 +242,7 @@ def _collect_news(queries: list[str], max_count: int = 30) -> str:
             if not results:
                 # 3. 头条双 IP 都空，降级百度（后续固定百度）
                 logger.info(f"头条双 IP 均空，降级百度搜索（后续固定百度）")
-                use_baidu = True
+                _use_baidu = True
                 time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
                 results = _search_baidu(q)
                 logger.info(f"[百度-{q}] {len(results)} 条")
