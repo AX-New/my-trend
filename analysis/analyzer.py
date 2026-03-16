@@ -40,7 +40,8 @@ def _parse_date_str(date_str: str) -> datetime | None:
     # X天前
     m = re.search(r'(\d+)\s*天前', date_str)
     if m:
-        return now - timedelta(days=int(m.group(1)))
+        days = min(int(m.group(1)), 3650)  # 防溢出，最多10年
+        return now - timedelta(days=days)
     if '刚刚' in date_str:
         return now
     if '昨天' in date_str:

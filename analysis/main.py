@@ -38,6 +38,9 @@ logger = logging.getLogger("analysis")
 
 DELAY = 1
 MAX_LLM_WORKERS = 3
+# 连续搜索失败退避：连续 N 只无新闻则暂停，避免被限流
+EMPTY_STREAK_THRESHOLD = 5   # 连续空结果触发退避
+BACKOFF_SECONDS = 300        # 退避时长（秒）
 
 # 来源标识：用主机名区分不同机器
 _SOURCE = platform.node()[:50]
@@ -64,7 +67,7 @@ def _create_run(session, total: int, task_type: str = "analysis") -> AnalysisRun
         task_type=task_type,
         status="running",
         total_count=total,
-        cursor=0,
+        done_cursor=0,
         fail_count=0,
         source=_SOURCE,
     )
@@ -76,7 +79,7 @@ def _create_run(session, total: int, task_type: str = "analysis") -> AnalysisRun
 
 def _advance_cursor(session, run: AnalysisRun, new_cursor: int):
     """推进游标到 new_cursor"""
-    run.cursor = new_cursor
+    run.done_cursor = new_cursor
     session.commit()
 
 
@@ -89,7 +92,7 @@ def _finish_run(session, run: AnalysisRun):
     run.status = "completed"
     run.finished_at = datetime.now()
     session.commit()
-    logger.info(f"[RUN] {run.run_id} 完成：cursor={run.cursor}/{run.total_count} fail={run.fail_count}")
+    logger.info(f"[RUN] {run.run_id} 完成：cursor={run.done_cursor}/{run.total_count} fail={run.fail_count}")
 
 
 def _start_or_resume_batch(session, total: int,
@@ -210,36 +213,35 @@ def run_domestic(session, llm):
 
 # ── 个股基本面 ──
 
-def _worker_id() -> str:
-    return threading.current_thread().name
-
-
-def _llm_task(code: str, name: str, prompt: str, article_count: int,
-              llm: LLMConfig, semaphore: threading.Semaphore):
-    wid = _worker_id()
-    logger.info(f"[{wid}] [{code}] 开始基本面 LLM 分析")
+def _llm_task(code, name, prompt, article_count, llm, semaphore):
+    """线程任务：调用 LLM 分析，完成后释放信号量"""
+    tid = threading.current_thread().name
+    logger.info(f"[{tid}] [{code}] 开始 LLM 分析")
     try:
-        result = _call_llm(prompt, llm)
-        logger.info(f"[{wid}] [{code}] 基本面 LLM 完成")
-        return {"code": code, "name": name, "data": result, "count": article_count}
+        data = _call_llm(prompt, llm)
+        logger.info(f"[{tid}] [{code}] LLM 完成")
+        return {"code": code, "name": name, "data": data, "count": article_count}
     finally:
         semaphore.release()
 
 
 def run_stocks(session, llm, codes_names: list[tuple[str, str]],
                run: AnalysisRun = None):
-    """个股基本面分析：主线程搜索新闻，LLM 丢线程池并发。
+    """个股基本面分析：串行搜索新闻，LLM 并发（滑动窗口）。
+
+    主线程按顺序搜索新闻，搜到后提交 LLM 到线程池（Semaphore 控制并发上限）。
+    搜索完一只就推进游标（LLM 结果异步回收）。
 
     run 不为 None 时走游标断点续跑（批量模式）：
       - codes_names 已按 code 排序（固定顺序）
-      - 从 run.cursor 位置开始，每完成一只推进 cursor
+      - 从 run.done_cursor 位置开始
     run 为 None 时直接跑全部（--stock 单股模式）。
     """
     run_id = run.run_id if run else None
 
     # 批量模式：从 cursor 位置截断
-    if run and run.cursor > 0:
-        skipped = run.cursor
+    if run and run.done_cursor > 0:
+        skipped = run.done_cursor
         codes_names = codes_names[skipped:]
         logger.info(f"[RUN {run_id}] 从第 {skipped} 只继续，剩余 {len(codes_names)} 只")
         if not codes_names:
@@ -248,15 +250,14 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
             return
 
     total = len(codes_names)
-    base_cursor = run.cursor if run else 0
+    base_cursor = run.done_cursor if run else 0
     logger.info(f"========== 基本面分析（{total} 只，LLM并发={MAX_LLM_WORKERS}）==========")
 
     semaphore = threading.Semaphore(MAX_LLM_WORKERS)
     executor = ThreadPoolExecutor(max_workers=MAX_LLM_WORKERS, thread_name_prefix="worker")
+    futures = {}
+    empty_streak = 0  # 连续搜索无结果计数
 
-    # 串行搜索新闻 + 提交 LLM，但不能直接推进 cursor（有并发 LLM 未完成）
-    # 策略：主线程记录已提交到第几只(submitted)，收割线程推进 cursor
-    # 简化：取消并发，改为串行（搜索+LLM 逐只完成），这样 cursor 严格递增
     for i, (code, name) in enumerate(codes_names):
         global_i = base_cursor + i + 1
         logger.info(f"[{code} {name}]（{global_i}/{run.total_count if run else total}）搜索新闻...")
@@ -265,39 +266,75 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
         articles = _collect_news(queries, max_count=30)
 
         if articles:
+            empty_streak = 0
             article_count = len(articles.strip().split("\n\n"))
             prompt = STOCK_PROMPT.format(
                 code=code, name=name, articles=articles, today=date.today(),
             )
-            logger.info(f"[{code}] 新闻 {article_count} 条，调用 LLM...")
-            data = _call_llm(prompt, llm)
-
-            if data:
-                _save(session, "stock", code, name, data, article_count, run_id=run_id)
-                if run:
-                    _resolve_failure(session, run_id, code)
-                logger.info(f"[{code}] 基本面: {data.get('summary', '')[:80]}")
-            else:
-                logger.warning(f"[{code}] LLM 返回空结果")
-                if run:
-                    _record_failure(session, run_id, code, name, "LLM返回空结果")
-                    _inc_fail(session, run)
+            semaphore.acquire()
+            fut = executor.submit(_llm_task, code, name, prompt, article_count, llm, semaphore)
+            futures[fut] = (code, name)
+            logger.info(f"[{code}] 新闻 {article_count} 条，已提交 LLM")
         else:
-            logger.warning(f"[{code}] 无新闻")
+            empty_streak += 1
+            logger.warning(f"[{code}] 无新闻（连续空 {empty_streak}）")
             if run:
                 _record_failure(session, run_id, code, name, "搜索无结果")
                 _inc_fail(session, run)
 
-        # 推进游标：这只已处理完（不管成功失败）
+            # 连续空结果：疑似被限流，停止搜索，等下次续跑
+            if empty_streak >= EMPTY_STREAK_THRESHOLD:
+                logger.warning(
+                    f"连续 {empty_streak} 只无新闻，疑似限流，停止搜索"
+                )
+                break
+
+        # 推进游标：这只已搜索完（LLM 异步处理）
         if run:
             _advance_cursor(session, run, base_cursor + i + 1)
 
         time.sleep(DELAY)
 
+        # 收割已完成的 future
+        for fut in [f for f in futures if f.done()]:
+            _handle_result(session, fut, futures.pop(fut), run_id, run)
+
+    # 等待剩余 LLM 任务完成
+    logger.info(f"搜索完毕，等待 {len(futures)} 个 LLM 任务完成...")
+    for fut in as_completed(futures):
+        _handle_result(session, fut, futures[fut], run_id, run)
+
+    executor.shutdown(wait=False)
+
     if run:
         _finish_run(session, run)
 
     logger.info("========== 基本面分析完成 ==========")
+
+
+def _handle_result(session, fut, meta, run_id, run):
+    """处理 LLM future 结果"""
+    code, name = meta
+    try:
+        result = fut.result()
+    except Exception as e:
+        logger.error(f"[{code}] LLM 异常: {e}")
+        if run:
+            _record_failure(session, run_id, code, name, str(e))
+            _inc_fail(session, run)
+        return
+
+    data = result["data"]
+    if data:
+        _save(session, "stock", code, name, data, result["count"], run_id=run_id)
+        if run:
+            _resolve_failure(session, run_id, code)
+        logger.info(f"[{code}] 基本面: {data.get('summary', '')[:80]}")
+    else:
+        logger.warning(f"[{code}] LLM 返回空结果")
+        if run:
+            _record_failure(session, run_id, code, name, "LLM返回空结果")
+            _inc_fail(session, run)
 
 
 # ── 辅助 ──
