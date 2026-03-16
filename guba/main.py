@@ -4,6 +4,7 @@
   python -m guba.main --stock 600519              # 单股情绪分析
   python -m guba.main --stock 600519,000858       # 多股
   python -m guba.main --market                    # 市场情绪采样（从人气排名分区间取40只）
+  python -m guba.main --all                       # 全市场（la_pick），支持断点续跑
 """
 
 import argparse
@@ -20,10 +21,8 @@ from guba.fetcher import (
     fetch_guba_posts, fetch_page1_timespan,
     classify_posts, calc_sentiment, _assign_weights,
 )
-from analysis.models import AnalysisRun
 from analysis.main import (
-    _start_or_resume_batch, _get_done_set, _mark_done,
-    _mark_fail, _finish_run,
+    _start_or_resume_batch, _advance_cursor, _inc_fail, _finish_run,
 )
 
 logging.basicConfig(
@@ -158,7 +157,7 @@ def run_stock(session, llm_cfg, codes: list[str]):
 
         time.sleep(DELAY)
 
-    # 5. 汇总入库
+    # 汇总入库
     if results:
         affected = batch_upsert(
             session, GubaSentiment, results,
@@ -176,21 +175,19 @@ def run_stock(session, llm_cfg, codes: list[str]):
 # 市场情绪采样（并发 LLM）
 # ═══════════════════════════════════════════
 
-# 采样区间：从 popularity_rank 的排名中取 4 个 tier
 SAMPLE_TIERS = {
-    "top":    (1, 10),      # 最热门
-    "mid_a":  (91, 100),    # 中上
-    "mid_b":  (491, 500),   # 中段
-    "tail":   (991, 1000),  # 尾部
+    "top":    (1, 10),
+    "mid_a":  (91, 100),
+    "mid_b":  (491, 500),
+    "tail":   (991, 1000),
 }
 
 
 def _sample_stocks(session) -> list[tuple[str, str, str, int]]:
-    """从最新 popularity_rank 按区间采样，返回 [(code, name, tier, rank), ...]"""
+    """从最新 popularity_rank 按区间采样"""
     from sqlalchemy import func
     from heat.models import PopularityRank
 
-    # 取最新交易日（不一定是 today，周末/节假日用最近的）
     latest_date = session.query(func.max(PopularityRank.date)).scalar()
     if not latest_date:
         logger.warning("[采样] popularity_rank 表无数据")
@@ -222,40 +219,26 @@ def _sample_stocks(session) -> list[tuple[str, str, str, int]]:
 
 
 def _llm_task(code: str, posts: list[dict], llm_cfg, semaphore: threading.Semaphore):
-    """线程任务：LLM 分类 + 计算情绪得分，完成后释放信号量"""
+    """线程任务：LLM 分类 + 计算情绪得分"""
     try:
         titles = [p["title"] for p in posts]
         labels = classify_posts(titles, llm_cfg)
-
         click_counts = [p["click_count"] for p in posts]
         weights = _assign_weights(click_counts)
         sentiment = calc_sentiment(posts, labels)
-
         return {
-            "code": code,
-            "posts": posts,
-            "labels": labels,
-            "weights": weights,
-            "sentiment": sentiment,
+            "code": code, "posts": posts,
+            "labels": labels, "weights": weights, "sentiment": sentiment,
         }
     finally:
         semaphore.release()
 
 
 def run_market(session, llm_cfg):
-    """市场情绪采样：分区间取股票 → 顺序抓帖子 → 并发 LLM 分类 → 入库
-
-    流程：
-      1. 从 popularity_rank 当日数据按 4 个区间采样 ~40 只
-      2. 主线程顺序抓帖子（1s 间隔限流）
-      3. 每抓完一只，提交 LLM 分类到线程池（最多 10 并发）
-      4. 线程池满时主线程阻塞，等待空闲线程
-      5. 所有任务完成后汇总入库
-    """
+    """市场情绪采样：分区间取股票 → 顺序抓帖子 → 并发 LLM 分类 → 入库"""
     start = time.time()
     today = datetime.now().date()
 
-    # 1. 采样
     sampled = _sample_stocks(session)
     if not sampled:
         logger.warning("[市场情绪] 无采样数据，请确认当日已执行人气排名采集")
@@ -263,12 +246,10 @@ def run_market(session, llm_cfg):
 
     logger.info(f"[市场情绪] 采样 {len(sampled)} 只股票，开始抓取...")
 
-    # 2. 顺序抓取 + 并发 LLM
     semaphore = threading.Semaphore(MAX_LLM_WORKERS)
     executor = ThreadPoolExecutor(max_workers=MAX_LLM_WORKERS)
-    futures = {}  # future -> (code, name, tier, rank)
-
-    timespans = {}  # code -> timespan
+    futures = {}
+    timespans = {}
 
     for i, (code, name, tier, rank) in enumerate(sampled):
         logger.info(f"[{code} {name}] 抓取帖子（{i+1}/{len(sampled)}，{tier} rank={rank}）")
@@ -281,15 +262,11 @@ def run_market(session, llm_cfg):
             continue
 
         logger.info(f"[{code}] {len(posts)} 条帖子，提交 LLM 分类...")
-
-        # 获取信号量（满 10 个则阻塞）
         semaphore.acquire()
         future = executor.submit(_llm_task, code, posts, llm_cfg, semaphore)
         futures[future] = (code, name, tier, rank)
-
         time.sleep(DELAY)
 
-    # 3. 等待所有 LLM 任务完成
     logger.info(f"[市场情绪] 帖子抓取完毕，等待 {len(futures)} 个 LLM 任务完成...")
     results = []
     for future in as_completed(futures):
@@ -317,30 +294,22 @@ def run_market(session, llm_cfg):
             f"首页跨度={ts_str}"
         )
 
-        # 保存帖子明细
         _save_post_details(
             session, code, today,
             result["posts"], result["labels"], result["weights"],
         )
 
         results.append({
-            "stock_code": code,
-            "date": today,
-            "score": sentiment["score"],
-            "post_count": sentiment["post_count"],
-            "bull_count": bull,
-            "bear_count": bear,
-            "neutral_count": neutral,
+            "stock_code": code, "date": today,
+            "score": sentiment["score"], "post_count": sentiment["post_count"],
+            "bull_count": bull, "bear_count": bear, "neutral_count": neutral,
             "total_read": sentiment["total_read"],
             "total_comment": sentiment["total_comment"],
-            "page1_timespan": ts,
-            "tier": tier,
-            "popularity_rank": rank,
+            "page1_timespan": ts, "tier": tier, "popularity_rank": rank,
         })
 
     executor.shutdown(wait=False)
 
-    # 4. 汇总入库
     if results:
         affected = batch_upsert(
             session, GubaSentiment, results,
@@ -354,7 +323,6 @@ def run_market(session, llm_cfg):
             f"affected {affected}，耗时 {elapsed:.1f}s"
         )
 
-        # 按 tier 汇总
         tier_scores = {}
         for r in results:
             t = r["tier"]
@@ -368,8 +336,12 @@ def run_market(session, llm_cfg):
         logger.warning("[市场情绪] 无有效结果")
 
 
+# ═══════════════════════════════════════════
+# 全市场（游标断点续跑）
+# ═══════════════════════════════════════════
+
 def _load_all_stocks() -> list[tuple[str, str]]:
-    """从 my_stock.la_pick 读取选股池，去重后返回 [(code, name), ...]"""
+    """从 my_stock.la_pick 读取选股池，按 code 排序（固定顺序）"""
     import pymysql
     conn = pymysql.connect(host="localhost", user="root", password="root", db="my_stock")
     cur = conn.cursor()
@@ -386,122 +358,83 @@ def _load_all_stocks() -> list[tuple[str, str]]:
 
 
 def run_all(session, llm_cfg, force_new: bool = False):
-    """全市场股吧情绪分析：顺序抓帖子 → 并发 LLM 分类 → 分批入库
+    """全市场股吧情绪：逐只串行（抓帖子+LLM），游标断点续跑。
 
-    通过 AnalysisRun(task_type='guba') 管理断点续跑：
-    - 启动时查找本机未完成的 guba run → 恢复跳过已完成的
-    - 每完成一只实时更新 run.done_codes
-    - 中断后重启自动续跑
+    游标模式：stock 列表按 code 排序（固定顺序），cursor 记录已处理到第几只。
+    中断后从 cursor 位置继续，不存储完成列表。
     """
     all_stocks = _load_all_stocks()
     if not all_stocks:
-        logger.warning("[全市场] stock_basic 无在市股票")
+        logger.warning("[全市场] la_pick 无股票")
         return
 
-    # 创建或恢复 run
-    run = _start_or_resume_batch(session, all_stocks, task_type="guba", force_new=force_new)
-    done = _get_done_set(run)
+    total = len(all_stocks)
+    run = _start_or_resume_batch(session, total, task_type="guba", force_new=force_new)
 
-    # 过滤已完成
-    if done:
-        before = len(all_stocks)
-        all_stocks = [(c, n) for c, n in all_stocks if c not in done]
-        logger.info(f"[RUN {run.run_id}] 断点续跑：跳过 {before - len(all_stocks)} 只，剩余 {len(all_stocks)} 只")
-        if not all_stocks:
-            _finish_run(session, run)
-            return
+    # 从 cursor 位置开始
+    start_idx = run.cursor or 0
+    if start_idx >= total:
+        logger.info(f"[RUN {run.run_id}] 全部已完成")
+        _finish_run(session, run)
+        return
+    if start_idx > 0:
+        logger.info(f"[RUN {run.run_id}] 从第 {start_idx} 只继续，剩余 {total - start_idx} 只")
 
     start = time.time()
     today = datetime.now().date()
-    total = len(all_stocks)
     total_saved = 0
-    total_empty = 0
-    BATCH = 100
 
-    for batch_idx in range(0, total, BATCH):
-        batch = all_stocks[batch_idx:batch_idx + BATCH]
-        batch_num = batch_idx // BATCH + 1
-        total_batches = (total + BATCH - 1) // BATCH
-        logger.info(f"[全市场] ── 第 {batch_num}/{total_batches} 批（{len(batch)} 只）──")
+    for i in range(start_idx, total):
+        code, name = all_stocks[i]
+        logger.info(f"[{code} {name}]（{i+1}/{total}）")
 
-        semaphore = threading.Semaphore(MAX_LLM_WORKERS)
-        executor = ThreadPoolExecutor(max_workers=MAX_LLM_WORKERS)
-        futures = {}
+        timespan = fetch_page1_timespan(code)
+        posts = fetch_guba_posts(code)
 
-        batch_timespans = {}
+        if posts:
+            titles = [p["title"] for p in posts]
+            labels = classify_posts(titles, llm_cfg)
+            click_counts = [p["click_count"] for p in posts]
+            weights = _assign_weights(click_counts)
+            sentiment = calc_sentiment(posts, labels)
 
-        for i, (code, name) in enumerate(batch):
-            global_i = batch_idx + i + 1
-            batch_timespans[code] = fetch_page1_timespan(code)
-            posts = fetch_guba_posts(code)
-            if not posts:
-                total_empty += 1
-                _mark_done(session, run, code)
-                if (global_i) % 50 == 0:
-                    logger.info(f"[全市场] 进度 {global_i}/{total}（空 {total_empty}）")
-                time.sleep(DELAY)
-                continue
+            if sentiment:
+                _save_post_details(session, code, today, posts, labels, weights)
 
-            logger.info(f"[{code} {name}] {len(posts)} 条帖子（{global_i}/{total}）")
-            semaphore.acquire()
-            future = executor.submit(_llm_task, code, posts, llm_cfg, semaphore)
-            futures[future] = (code, name)
-            time.sleep(DELAY)
+                row = {
+                    "stock_code": code, "date": today,
+                    "score": sentiment["score"],
+                    "post_count": sentiment["post_count"],
+                    "bull_count": sentiment["bull_count"],
+                    "bear_count": sentiment["bear_count"],
+                    "neutral_count": sentiment["neutral_count"],
+                    "total_read": sentiment["total_read"],
+                    "total_comment": sentiment["total_comment"],
+                    "page1_timespan": timespan,
+                }
+                batch_upsert(
+                    session, GubaSentiment, [row],
+                    update_cols=["score", "post_count", "bull_count", "bear_count",
+                                 "neutral_count", "total_read", "total_comment",
+                                 "page1_timespan"],
+                )
+                total_saved += 1
+                logger.info(f"[{code}] 情绪={sentiment['score']:.1f}")
+            else:
+                _inc_fail(session, run)
+        else:
+            if (i + 1) % 50 == 0:
+                logger.info(f"[全市场] 进度 {i+1}/{total}")
 
-        # 收集本批结果
-        results = []
-        for future in as_completed(futures):
-            code, name = futures[future]
-            try:
-                result = future.result()
-            except Exception as e:
-                logger.error(f"[{code}] LLM 异常: {e}")
-                _mark_fail(session, run)
-                _mark_done(session, run, code)
-                continue
-
-            sentiment = result["sentiment"]
-            if sentiment is None:
-                _mark_done(session, run, code)
-                continue
-
-            _save_post_details(
-                session, code, today,
-                result["posts"], result["labels"], result["weights"],
-            )
-
-            results.append({
-                "stock_code": code,
-                "date": today,
-                "score": sentiment["score"],
-                "post_count": sentiment["post_count"],
-                "bull_count": sentiment["bull_count"],
-                "bear_count": sentiment["bear_count"],
-                "neutral_count": sentiment["neutral_count"],
-                "total_read": sentiment["total_read"],
-                "total_comment": sentiment["total_comment"],
-                "page1_timespan": batch_timespans.get(code),
-            })
-            _mark_done(session, run, code)
-
-        executor.shutdown(wait=True)
-
-        # 本批入库
-        if results:
-            affected = batch_upsert(
-                session, GubaSentiment, results,
-                update_cols=["score", "post_count", "bull_count", "bear_count",
-                             "neutral_count", "total_read", "total_comment",
-                             "page1_timespan"],
-            )
-            total_saved += len(results)
-            logger.info(f"[全市场] 第 {batch_num} 批完成：{len(results)} 只有效，affected {affected}")
+        # 推进游标
+        _advance_cursor(session, run, i + 1)
+        time.sleep(DELAY)
 
     _finish_run(session, run)
     elapsed = time.time() - start
     logger.info(
-        f"[全市场] 全部完成：{total_saved}/{total} 只有效，"
-        f"{total_empty} 只无帖子，耗时 {elapsed:.0f}s（{elapsed/3600:.1f}h）"
+        f"[全市场] 完成：{total_saved}/{total} 只有效，"
+        f"耗时 {elapsed:.0f}s（{elapsed/3600:.1f}h）"
     )
 
 

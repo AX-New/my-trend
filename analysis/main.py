@@ -7,8 +7,8 @@
   python -m analysis.main --stock 601789,000858 # 多只个股
   python -m analysis.main --all                 # 国际+国内+个股（stocks.txt）
   python -m analysis.main --all-stocks          # 全量个股（la_pick），支持断点续跑
-  python -m analysis.main --retry               # 重跑今天失败的股票
-  python -m analysis.main --all-stocks --no-resume  # 强制全量重跑，不跳过已完成
+  python -m analysis.main --retry               # 重跑最近一次失败的股票
+  python -m analysis.main --all-stocks --no-resume  # 强制全量重跑
 """
 
 import argparse
@@ -43,15 +43,14 @@ MAX_LLM_WORKERS = 3
 _SOURCE = platform.node()[:50]
 
 
-# ── run_id 管理 ──
+# ── run 管理（游标模式）──
 
 def _gen_run_id() -> str:
-    """生成运行ID：日期时间_来源"""
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def _find_active_run(session, task_type: str = "analysis") -> AnalysisRun | None:
-    """查找 status=running 的批量运行记录（本机来源 + 任务类型）"""
+    """查找本机未完成的运行"""
     return session.query(AnalysisRun).filter(
         AnalysisRun.status == "running",
         AnalysisRun.source == _SOURCE,
@@ -60,57 +59,66 @@ def _find_active_run(session, task_type: str = "analysis") -> AnalysisRun | None
 
 
 def _create_run(session, total: int, task_type: str = "analysis") -> AnalysisRun:
-    """创建新的批量运行记录"""
     run = AnalysisRun(
         run_id=_gen_run_id(),
         task_type=task_type,
         status="running",
         total_count=total,
-        done_count=0,
+        cursor=0,
         fail_count=0,
-        done_codes="",
         source=_SOURCE,
     )
     session.add(run)
     session.commit()
-    logger.info(f"[RUN] 新建运行 {run.run_id}（{task_type}，{total} 只，来源={_SOURCE}）")
+    logger.info(f"[RUN] 新建 {run.run_id}（{task_type}，{total} 只，来源={_SOURCE}）")
     return run
 
 
-def _get_done_set(run: AnalysisRun) -> set[str]:
-    """从 run 记录解析已完成的代码集合"""
-    if not run.done_codes:
-        return set()
-    return set(run.done_codes.split(","))
-
-
-def _mark_done(session, run: AnalysisRun, code: str):
-    """标记一只股票完成，更新 run 进度"""
-    done = _get_done_set(run)
-    done.add(code)
-    run.done_codes = ",".join(sorted(done))
-    run.done_count = len(done)
+def _advance_cursor(session, run: AnalysisRun, new_cursor: int):
+    """推进游标到 new_cursor"""
+    run.cursor = new_cursor
     session.commit()
 
 
-def _mark_fail(session, run: AnalysisRun):
-    """递增失败计数"""
+def _inc_fail(session, run: AnalysisRun):
     run.fail_count = (run.fail_count or 0) + 1
     session.commit()
 
 
 def _finish_run(session, run: AnalysisRun):
-    """标记运行完成"""
     run.status = "completed"
     run.finished_at = datetime.now()
     session.commit()
-    logger.info(f"[RUN] 运行 {run.run_id} 完成：done={run.done_count} fail={run.fail_count}")
+    logger.info(f"[RUN] {run.run_id} 完成：cursor={run.cursor}/{run.total_count} fail={run.fail_count}")
+
+
+def _start_or_resume_batch(session, total: int,
+                           task_type: str = "analysis",
+                           force_new: bool = False) -> AnalysisRun:
+    """恢复未完成的 run 或创建新 run"""
+    if not force_new:
+        active = _find_active_run(session, task_type)
+        if active:
+            logger.info(f"[RUN] 恢复 {active.run_id}（cursor={active.cursor}/{active.total_count}）")
+            return active
+
+    # 中断旧 run
+    old_runs = session.query(AnalysisRun).filter(
+        AnalysisRun.status == "running",
+        AnalysisRun.source == _SOURCE,
+        AnalysisRun.task_type == task_type,
+    ).all()
+    for r in old_runs:
+        r.status = "interrupted"
+        r.finished_at = datetime.now()
+    session.commit()
+
+    return _create_run(session, total, task_type)
 
 
 # ── 失败记录 ──
 
 def _record_failure(session, run_id: str, code: str, name: str, error: str):
-    """记录分析失败"""
     existing = session.query(AnalysisFailure).filter(
         AnalysisFailure.stock_code == code,
         AnalysisFailure.run_id == run_id,
@@ -128,7 +136,6 @@ def _record_failure(session, run_id: str, code: str, name: str, error: str):
 
 
 def _resolve_failure(session, run_id: str, code: str):
-    """标记失败已解决"""
     session.query(AnalysisFailure).filter(
         AnalysisFailure.stock_code == code,
         AnalysisFailure.run_id == run_id,
@@ -139,7 +146,6 @@ def _resolve_failure(session, run_id: str, code: str):
 
 
 def _get_failed_codes(session, run_id: str) -> list[tuple[str, str]]:
-    """获取指定运行中未解决的失败记录"""
     rows = session.query(
         AnalysisFailure.stock_code,
         AnalysisFailure.stock_name,
@@ -151,9 +157,10 @@ def _get_failed_codes(session, run_id: str) -> list[tuple[str, str]]:
     return [(r[0], r[1] or r[0]) for r in rows]
 
 
+# ── 保存结果 ──
+
 def _save(session, analysis_type: str, code: str, name: str,
           data: dict, article_count: int = 0, run_id: str = None):
-    """保存分析结果，提取 sentiment/summary/score 后剩余字段存 detail"""
     sentiment = data.get("sentiment", "")
     summary = data.get("summary", "")
     score = data.get("score", 0.0)
@@ -179,8 +186,9 @@ def _save(session, analysis_type: str, code: str, name: str,
     logger.info(f"[{analysis_type}] {code or '—'} | {sentiment} | score={score:.0f} | affected={affected}")
 
 
+# ── 国际/国内 ──
+
 def run_global(session, llm):
-    """国际形势分析"""
     logger.info("========== 国际形势分析 ==========")
     data = analyze_global(llm)
     if data:
@@ -191,7 +199,6 @@ def run_global(session, llm):
 
 
 def run_domestic(session, llm):
-    """国内形势分析"""
     logger.info("========== 国内形势分析 ==========")
     data = analyze_domestic(llm)
     if data:
@@ -201,15 +208,14 @@ def run_domestic(session, llm):
         logger.warning("国内形势分析失败")
 
 
+# ── 个股基本面 ──
 
 def _worker_id() -> str:
-    """返回当前线程的 worker 编号，如 worker_0"""
     return threading.current_thread().name
 
 
 def _llm_task(code: str, name: str, prompt: str, article_count: int,
               llm: LLMConfig, semaphore: threading.Semaphore):
-    """线程任务：LLM 基本面分析"""
     wid = _worker_id()
     logger.info(f"[{wid}] [{code}] 开始基本面 LLM 分析")
     try:
@@ -224,33 +230,36 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
                run: AnalysisRun = None):
     """个股基本面分析：主线程搜索新闻，LLM 丢线程池并发。
 
-    run 不为 None 时走 run_id 断点续跑（批量模式）。
-    run 为 None 时直接跑，不记录进度（--stock 单股模式）。
+    run 不为 None 时走游标断点续跑（批量模式）：
+      - codes_names 已按 code 排序（固定顺序）
+      - 从 run.cursor 位置开始，每完成一只推进 cursor
+    run 为 None 时直接跑全部（--stock 单股模式）。
     """
     run_id = run.run_id if run else None
 
-    # 批量模式：跳过已完成的
-    if run:
-        done = _get_done_set(run)
-        if done:
-            before = len(codes_names)
-            codes_names = [(c, n) for c, n in codes_names if c not in done]
-            skipped = before - len(codes_names)
-            logger.info(f"[RUN {run_id}] 断点续跑：跳过 {skipped} 只已完成，剩余 {len(codes_names)} 只")
-            if not codes_names:
-                logger.info(f"[RUN {run_id}] 全部已完成")
-                _finish_run(session, run)
-                return
+    # 批量模式：从 cursor 位置截断
+    if run and run.cursor > 0:
+        skipped = run.cursor
+        codes_names = codes_names[skipped:]
+        logger.info(f"[RUN {run_id}] 从第 {skipped} 只继续，剩余 {len(codes_names)} 只")
+        if not codes_names:
+            logger.info(f"[RUN {run_id}] 全部已完成")
+            _finish_run(session, run)
+            return
 
     total = len(codes_names)
+    base_cursor = run.cursor if run else 0
     logger.info(f"========== 基本面分析（{total} 只，LLM并发={MAX_LLM_WORKERS}）==========")
 
     semaphore = threading.Semaphore(MAX_LLM_WORKERS)
     executor = ThreadPoolExecutor(max_workers=MAX_LLM_WORKERS, thread_name_prefix="worker")
-    futures = {}
 
+    # 串行搜索新闻 + 提交 LLM，但不能直接推进 cursor（有并发 LLM 未完成）
+    # 策略：主线程记录已提交到第几只(submitted)，收割线程推进 cursor
+    # 简化：取消并发，改为串行（搜索+LLM 逐只完成），这样 cursor 严格递增
     for i, (code, name) in enumerate(codes_names):
-        logger.info(f"[{code} {name}]（{i+1}/{total}）搜索新闻...")
+        global_i = base_cursor + i + 1
+        logger.info(f"[{code} {name}]（{global_i}/{run.total_count if run else total}）搜索新闻...")
 
         queries = [name, f"{name} 项目", f"{name} 利润", f"{name} 行业前景", f"{name} 产品"]
         articles = _collect_news(queries, max_count=30)
@@ -260,27 +269,30 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
             prompt = STOCK_PROMPT.format(
                 code=code, name=name, articles=articles, today=date.today(),
             )
-            semaphore.acquire()
-            fut = executor.submit(_llm_task, code, name, prompt, article_count, llm, semaphore)
-            futures[fut] = (code, name)
-            logger.info(f"[{code}] 新闻 {article_count} 条，已提交 LLM")
+            logger.info(f"[{code}] 新闻 {article_count} 条，调用 LLM...")
+            data = _call_llm(prompt, llm)
+
+            if data:
+                _save(session, "stock", code, name, data, article_count, run_id=run_id)
+                if run:
+                    _resolve_failure(session, run_id, code)
+                logger.info(f"[{code}] 基本面: {data.get('summary', '')[:80]}")
+            else:
+                logger.warning(f"[{code}] LLM 返回空结果")
+                if run:
+                    _record_failure(session, run_id, code, name, "LLM返回空结果")
+                    _inc_fail(session, run)
         else:
             logger.warning(f"[{code}] 无新闻")
             if run:
                 _record_failure(session, run_id, code, name, "搜索无结果")
-                _mark_fail(session, run)
+                _inc_fail(session, run)
+
+        # 推进游标：这只已处理完（不管成功失败）
+        if run:
+            _advance_cursor(session, run, base_cursor + i + 1)
 
         time.sleep(DELAY)
-
-        # 定期收割已完成的 future
-        for fut in [f for f in futures if f.done()]:
-            _handle_stock_future(session, fut, futures.pop(fut), run)
-
-    logger.info(f"搜索完毕，等待 {len(futures)} 个 LLM 任务完成...")
-    for fut in as_completed(futures):
-        _handle_stock_future(session, fut, futures[fut], run)
-
-    executor.shutdown(wait=False)
 
     if run:
         _finish_run(session, run)
@@ -288,36 +300,9 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
     logger.info("========== 基本面分析完成 ==========")
 
 
-def _handle_stock_future(session, fut, meta, run: AnalysisRun = None):
-    """处理基本面 LLM future"""
-    code, name = meta
-    run_id = run.run_id if run else None
-
-    try:
-        result = fut.result()
-    except Exception as e:
-        logger.error(f"[{code}] 基本面 LLM 异常: {e}")
-        if run:
-            _record_failure(session, run_id, code, name, str(e))
-            _mark_fail(session, run)
-        return
-
-    data = result["data"]
-    if data:
-        _save(session, "stock", code, name, data, result["count"], run_id=run_id)
-        if run:
-            _mark_done(session, run, code)
-            _resolve_failure(session, run_id, code)
-        logger.info(f"[{code}] 基本面: {data.get('summary', '')[:80]}")
-    else:
-        logger.warning(f"[{code}] 基本面分析失败")
-        if run:
-            _record_failure(session, run_id, code, name, "LLM返回空结果")
-            _mark_fail(session, run)
-
+# ── 辅助 ──
 
 def _lookup_name(code: str) -> str:
-    """查股票名"""
     import pymysql
     try:
         conn = pymysql.connect(
@@ -333,7 +318,7 @@ def _lookup_name(code: str) -> str:
 
 
 def _load_all_stocks() -> list[tuple[str, str]]:
-    """从 my_stock.la_pick 读取选股池，去重后返回 [(code, name), ...]"""
+    """从 my_stock.la_pick 读取选股池，按 code 排序（固定顺序，游标依赖此顺序）"""
     import pymysql
     conn = pymysql.connect(host="localhost", user="root", password="root", db="my_stock")
     cur = conn.cursor()
@@ -347,30 +332,6 @@ def _load_all_stocks() -> list[tuple[str, str]]:
     conn.close()
     logger.info(f"[la_pick] 读取到 {len(rows)} 只股票")
     return [(r[0], r[1]) for r in rows]
-
-
-def _start_or_resume_batch(session, codes_names: list[tuple[str, str]],
-                           task_type: str = "analysis",
-                           force_new: bool = False) -> AnalysisRun:
-    """批量模式：恢复未完成的 run 或创建新 run"""
-    if not force_new:
-        active = _find_active_run(session, task_type)
-        if active:
-            logger.info(f"[RUN] 恢复中断的运行 {active.run_id}（进度 {active.done_count}/{active.total_count}）")
-            return active
-
-    # 中断旧的未完成 run
-    old_runs = session.query(AnalysisRun).filter(
-        AnalysisRun.status == "running",
-        AnalysisRun.source == _SOURCE,
-        AnalysisRun.task_type == task_type,
-    ).all()
-    for r in old_runs:
-        r.status = "interrupted"
-        r.finished_at = datetime.now()
-    session.commit()
-
-    return _create_run(session, len(codes_names), task_type)
 
 
 def main():
@@ -399,7 +360,6 @@ def main():
 
     try:
         if args.retry is not None:
-            # 找 run_id
             if args.retry == "latest":
                 last_run = session.query(AnalysisRun).order_by(
                     AnalysisRun.started_at.desc()
@@ -425,7 +385,8 @@ def main():
             time.sleep(DELAY)
             codes_names = _load_all_stocks()
             if codes_names:
-                run = _start_or_resume_batch(session, codes_names, force_new=args.no_resume)
+                run = _start_or_resume_batch(session, len(codes_names),
+                                             force_new=args.no_resume)
                 run_stocks(session, cfg.llm, codes_names, run=run)
 
         elif args.all:
@@ -435,8 +396,12 @@ def main():
             time.sleep(DELAY)
             stocks = load_stocks(cfg)
             if stocks:
-                codes_names = [(s.code, s.name or _lookup_name(s.code)) for s in stocks]
-                run = _start_or_resume_batch(session, codes_names, force_new=args.no_resume)
+                codes_names = sorted(
+                    [(s.code, s.name or _lookup_name(s.code)) for s in stocks],
+                    key=lambda x: x[0],
+                )
+                run = _start_or_resume_batch(session, len(codes_names),
+                                             force_new=args.no_resume)
                 run_stocks(session, cfg.llm, codes_names, run=run)
 
         else:
@@ -445,7 +410,6 @@ def main():
             if args.domestic:
                 run_domestic(session, cfg.llm)
             if args.stock:
-                # 单股模式：不记录 run，直接跑
                 codes = [c.strip() for c in args.stock.split(",") if c.strip()]
                 codes_names = [(c, _lookup_name(c)) for c in codes]
                 run_stocks(session, cfg.llm, codes_names)
