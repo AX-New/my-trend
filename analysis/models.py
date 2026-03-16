@@ -8,15 +8,43 @@ from sqlalchemy import (
 from database import Base
 
 
+class AnalysisRun(Base):
+    """批量分析运行记录，每次 --all-stocks 创建一条
+
+    断点续跑逻辑：启动时查 status=running 的记录，恢复未完成的股票。
+    多任务不冲突：每个批量任务只看自己的 run_id。
+    """
+    __tablename__ = "analysis_run"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(32), nullable=False, unique=True, comment="运行ID，如 20260316_180000")
+    task_type = Column(String(20), nullable=False, default="analysis",
+                       comment="任务类型: analysis/guba")
+    status = Column(String(20), nullable=False, default="running",
+                    comment="running/completed/interrupted")
+    total_count = Column(Integer, default=0, comment="总股票数")
+    done_count = Column(Integer, default=0, comment="已完成数")
+    fail_count = Column(Integer, default=0, comment="失败数")
+    done_codes = Column(Text, comment="已完成的股票代码（逗号分隔）")
+    source = Column(String(50), comment="来源标识，用主机名区分")
+    started_at = Column(DateTime, default=datetime.now)
+    finished_at = Column(DateTime, comment="完成时间")
+
+    __table_args__ = (
+        Index("idx_ar_status_type", "status", "task_type"),
+    )
+
+
 class AnalysisFailure(Base):
-    """分析失败记录，用于断点续跑和失败重试"""
+    """分析失败记录"""
     __tablename__ = "analysis_failure"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     stock_code = Column(String(20), nullable=False, comment="股票代码")
     stock_name = Column(String(50), comment="股票简称")
+    run_id = Column(String(32), comment="所属运行ID")
     date = Column(Date, nullable=False, comment="分析日期")
-    stage = Column(String(20), nullable=False, comment="失败阶段: search/llm/guba")
+    stage = Column(String(20), nullable=False, comment="失败阶段: search/llm")
     error = Column(Text, comment="错误信息")
     retried = Column(Integer, default=0, comment="已重试次数")
     resolved = Column(Integer, default=0, comment="是否已解决: 0=未解决 1=已解决")
@@ -24,8 +52,8 @@ class AnalysisFailure(Base):
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
     __table_args__ = (
-        UniqueConstraint("stock_code", "date", "stage", name="uq_af_code_date_stage"),
-        Index("idx_af_date_resolved", "date", "resolved"),
+        UniqueConstraint("stock_code", "run_id", "stage", name="uq_af_code_run_stage"),
+        Index("idx_af_run_resolved", "run_id", "resolved"),
     )
 
 
@@ -51,8 +79,11 @@ class NewsAnalysis(Base):
     detail = Column(Text, comment="各维度分析结论（JSON）")
     created_at = Column(DateTime, default=datetime.now)
 
+    run_id = Column(String(32), comment="所属批量运行ID")
+
     __table_args__ = (
         UniqueConstraint("analysis_type", "stock_code", "date", name="uq_na_type_code_date"),
         Index("idx_na_date", "date"),
         Index("idx_na_type", "analysis_type"),
+        Index("idx_na_run_id", "run_id"),
     )

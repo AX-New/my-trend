@@ -20,6 +20,11 @@ from guba.fetcher import (
     fetch_guba_posts, fetch_page1_timespan,
     classify_posts, calc_sentiment, _assign_weights,
 )
+from analysis.models import AnalysisRun
+from analysis.main import (
+    _start_or_resume_batch, _get_done_set, _mark_done,
+    _mark_fail, _finish_run,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -380,16 +385,31 @@ def _load_all_stocks() -> list[tuple[str, str]]:
     return [(r[0], r[1]) for r in rows]
 
 
-def run_all(session, llm_cfg):
+def run_all(session, llm_cfg, force_new: bool = False):
     """全市场股吧情绪分析：顺序抓帖子 → 并发 LLM 分类 → 分批入库
 
-    与 run_market 类似的并发模式，但处理全部在市股票（~5500 只）。
-    每 100 只股票一个批次，批内结果及时入库防丢失。
+    通过 AnalysisRun(task_type='guba') 管理断点续跑：
+    - 启动时查找本机未完成的 guba run → 恢复跳过已完成的
+    - 每完成一只实时更新 run.done_codes
+    - 中断后重启自动续跑
     """
     all_stocks = _load_all_stocks()
     if not all_stocks:
         logger.warning("[全市场] stock_basic 无在市股票")
         return
+
+    # 创建或恢复 run
+    run = _start_or_resume_batch(session, all_stocks, task_type="guba", force_new=force_new)
+    done = _get_done_set(run)
+
+    # 过滤已完成
+    if done:
+        before = len(all_stocks)
+        all_stocks = [(c, n) for c, n in all_stocks if c not in done]
+        logger.info(f"[RUN {run.run_id}] 断点续跑：跳过 {before - len(all_stocks)} 只，剩余 {len(all_stocks)} 只")
+        if not all_stocks:
+            _finish_run(session, run)
+            return
 
     start = time.time()
     today = datetime.now().date()
@@ -416,6 +436,7 @@ def run_all(session, llm_cfg):
             posts = fetch_guba_posts(code)
             if not posts:
                 total_empty += 1
+                _mark_done(session, run, code)
                 if (global_i) % 50 == 0:
                     logger.info(f"[全市场] 进度 {global_i}/{total}（空 {total_empty}）")
                 time.sleep(DELAY)
@@ -435,10 +456,13 @@ def run_all(session, llm_cfg):
                 result = future.result()
             except Exception as e:
                 logger.error(f"[{code}] LLM 异常: {e}")
+                _mark_fail(session, run)
+                _mark_done(session, run, code)
                 continue
 
             sentiment = result["sentiment"]
             if sentiment is None:
+                _mark_done(session, run, code)
                 continue
 
             _save_post_details(
@@ -458,6 +482,7 @@ def run_all(session, llm_cfg):
                 "total_comment": sentiment["total_comment"],
                 "page1_timespan": batch_timespans.get(code),
             })
+            _mark_done(session, run, code)
 
         executor.shutdown(wait=True)
 
@@ -472,6 +497,7 @@ def run_all(session, llm_cfg):
             total_saved += len(results)
             logger.info(f"[全市场] 第 {batch_num} 批完成：{len(results)} 只有效，affected {affected}")
 
+    _finish_run(session, run)
     elapsed = time.time() - start
     logger.info(
         f"[全市场] 全部完成：{total_saved}/{total} 只有效，"
@@ -482,13 +508,15 @@ def run_all(session, llm_cfg):
 def main():
     parser = argparse.ArgumentParser(description="股吧情绪分析")
     parser.add_argument("-c", "--config", default=None)
+    parser.add_argument("--no-resume", action="store_true",
+                        help="强制新建 run，不恢复中断的运行（仅 --all）")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--stock", type=str,
                        help="股票代码，多只用逗号分隔")
     group.add_argument("--market", action="store_true",
                        help="市场情绪采样（从人气排名分区间取40只）")
     group.add_argument("--all", action="store_true",
-                       help="全市场股吧情绪（stock_basic 全部在市股票）")
+                       help="全市场股吧情绪（la_pick），支持断点续跑")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -503,7 +531,7 @@ def main():
             logger.info("========== 市场情绪采样完成 ==========")
         elif args.all:
             logger.info("========== 全市场股吧情绪开始 ==========")
-            run_all(session, cfg.llm)
+            run_all(session, cfg.llm, force_new=args.no_resume)
             logger.info("========== 全市场股吧情绪完成 ==========")
         else:
             codes = [c.strip() for c in args.stock.split(",") if c.strip()]
