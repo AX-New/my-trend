@@ -103,7 +103,7 @@ def _start_or_resume_batch(session, total: int,
     if not force_new:
         active = _find_active_run(session, task_type)
         if active:
-            logger.info(f"[RUN] 恢复 {active.run_id}（cursor={active.cursor}/{active.total_count}）")
+            logger.info(f"[RUN] 恢复 {active.run_id}（cursor={active.done_cursor}/{active.total_count}）")
             return active
 
     # 中断旧 run
@@ -258,6 +258,7 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
     executor = ThreadPoolExecutor(max_workers=MAX_LLM_WORKERS, thread_name_prefix="worker")
     futures = {}
     empty_streak = 0  # 连续搜索无结果计数
+    stopped_early = False  # 是否因限流等原因提前退出
 
     for i, (code, name) in enumerate(codes_names):
         global_i = base_cursor + i + 1
@@ -288,6 +289,7 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
                 logger.warning(
                     f"连续 {empty_streak} 只无新闻，疑似限流，停止搜索"
                 )
+                stopped_early = True
                 break
 
         # 推进游标：这只已搜索完（LLM 异步处理）
@@ -308,7 +310,10 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
     executor.shutdown(wait=False)
 
     if run:
-        _finish_run(session, run)
+        if stopped_early:
+            logger.info(f"[RUN {run_id}] 提前退出，保持 running 状态，下次续跑")
+        else:
+            _finish_run(session, run)
 
     logger.info("========== 基本面分析完成 ==========")
 
