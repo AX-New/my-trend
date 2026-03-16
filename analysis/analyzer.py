@@ -74,7 +74,7 @@ def _parse_date_str(date_str: str) -> datetime | None:
     return None
 
 
-# ── 搜索引擎：头条（主）+ 百度新闻（备） ──
+# ── 搜索引擎：今日头条 ──
 
 _session: cffi_req.Session | None = None
 
@@ -83,10 +83,6 @@ def _get_session() -> cffi_req.Session:
     global _session
     if _session is None:
         _session = cffi_req.Session(impersonate="chrome120")
-        try:
-            _session.get("https://www.baidu.com/", timeout=10)
-        except Exception:
-            pass
     return _session
 
 
@@ -137,64 +133,10 @@ def _search_toutiao(query: str, timeout: int = 15) -> list[dict]:
     return results
 
 
-def _search_baidu(query: str, timeout: int = 15) -> list[dict]:
-    """百度新闻搜索，返回 [{"title": ..., "summary": ..., "date_str": ..., "date": ...}, ...]"""
-    try:
-        session = _get_session()
-        resp = session.get(
-            "https://www.baidu.com/s",
-            params={"wd": query, "tn": "news", "rtt": 1},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.warning(f"[百度-{query}] 失败: {e}")
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    results = []
-    for item in soup.select(".result-op, .result"):
-        title_el = item.select_one("h3 a") or item.select_one(".news-title a")
-        if not title_el:
-            continue
-        title = title_el.get_text(strip=True)
-        if not title:
-            continue
-        summary_el = item.select_one(".c-summary, .c-abstract, .c-span-last")
-        summary = summary_el.get_text(strip=True)[:200] if summary_el else ""
-
-        # 提取时间信息
-        date_str = ""
-        time_el = item.select_one(".c-color-gray2, .c-color-gray, .news-source span:last-child")
-        if time_el:
-            date_str = time_el.get_text(strip=True)
-        if not date_str:
-            text = item.get_text(strip=True)
-            for pattern in [r'\d+分钟前', r'\d+小时前', r'\d+天前', r'昨天', r'前天',
-                            r'\d{4}[-/]\d{1,2}[-/]\d{1,2}', r'\d{1,2}月\d{1,2}日']:
-                m = re.search(pattern, text)
-                if m:
-                    date_str = m.group(0)
-                    break
-
-        results.append({
-            "title": title,
-            "summary": summary,
-            "date_str": date_str,
-            "date": _parse_date_str(date_str),
-        })
-    return results
-
-
 def _search(query: str, timeout: int = 15) -> list[dict]:
-    """搜索新闻：头条优先，返回0条时 fallback 百度"""
+    """搜索新闻：今日头条"""
     results = _search_toutiao(query, timeout)
-    if results:
-        logger.info(f"[头条-{query}] {len(results)} 条")
-        return results
-
-    results = _search_baidu(query, timeout)
-    logger.info(f"[百度-{query}] {len(results)} 条")
+    logger.info(f"[头条-{query}] {len(results)} 条")
     return results
 
 

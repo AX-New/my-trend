@@ -375,7 +375,7 @@ def _load_all_stocks(cfg) -> list[tuple[str, str]]:
 
 
 def _load_la_stocks(cfg) -> list[tuple[str, str]]:
-    """从 my_stock.la_pick 读取选股池，按 code 排序（固定顺序，游标依赖此顺序）"""
+    """从 my_stock.la_pick 读取最新日期的选股池，按 code 排序（固定顺序，游标依赖此顺序）"""
     import pymysql
     db = cfg.database
     conn = pymysql.connect(host=db.host, port=db.port, user=db.user, password=db.password, db="my_stock")
@@ -384,6 +384,7 @@ def _load_la_stocks(cfg) -> list[tuple[str, str]]:
         "SELECT code, name FROM ("
         "  SELECT DISTINCT SUBSTRING_INDEX(ts_code, '.', 1) AS code, stock_name AS name"
         "  FROM la_pick"
+        "  WHERE eval_date = (SELECT MAX(eval_date) FROM la_pick)"
         ") t ORDER BY code"
     )
     rows = cur.fetchall()
@@ -402,7 +403,7 @@ def main():
     parser.add_argument("--stock", type=str, default=None,
                         help="个股分析，多只用逗号分隔（不记录 run）")
     parser.add_argument("--all", action="store_true",
-                        help="全部分析（国际+国内+stocks.txt个股，记录 run）")
+                        help="stocks.txt个股分析，记录 run")
     parser.add_argument("--all-stocks", action="store_true",
                         help="全量个股分析（stock_basic 全市场），记录 run，支持断点续跑")
     parser.add_argument("--all-la", action="store_true",
@@ -439,10 +440,6 @@ def main():
                 logger.info(f"run={retry_run_id} 没有失败记录")
 
         elif args.all_stocks:
-            run_global(session, cfg.llm)
-            time.sleep(DELAY)
-            run_domestic(session, cfg.llm)
-            time.sleep(DELAY)
             codes_names = _load_all_stocks(cfg)
             if codes_names:
                 run = _start_or_resume_batch(session, len(codes_names),
@@ -451,10 +448,6 @@ def main():
                 run_stocks(session, cfg.llm, codes_names, run=run)
 
         elif args.all_la:
-            run_global(session, cfg.llm)
-            time.sleep(DELAY)
-            run_domestic(session, cfg.llm)
-            time.sleep(DELAY)
             codes_names = _load_la_stocks(cfg)
             if codes_names:
                 run = _start_or_resume_batch(session, len(codes_names),
@@ -463,10 +456,6 @@ def main():
                 run_stocks(session, cfg.llm, codes_names, run=run)
 
         elif args.all:
-            run_global(session, cfg.llm)
-            time.sleep(DELAY)
-            run_domestic(session, cfg.llm)
-            time.sleep(DELAY)
             stocks = load_stocks(cfg)
             if stocks:
                 codes_names = sorted(

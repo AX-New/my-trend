@@ -1,6 +1,6 @@
 """新闻采集 —— 能力层
 
-搜索引擎：今日头条（主） + 搜狗新闻（备），curl_cffi 绕反爬。
+搜索引擎：今日头条，curl_cffi 绕反爬。
 每个函数是单次调用，调度层负责循环和间隔控制。
 """
 
@@ -81,53 +81,12 @@ def _fetch_toutiao(query: str, timeout: int = 15) -> list[RawArticle]:
     return articles
 
 
-# ── 搜狗新闻搜索（备用） ──
-
-def _fetch_sogou(query: str, timeout: int = 15) -> list[RawArticle]:
-    """搜狗新闻搜索"""
-    try:
-        session = _get_session()
-        resp = session.get(
-            "https://news.sogou.com/news",
-            params={"query": query, "mode": 1},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.debug(f"[搜狗新闻-{query}] 请求失败: {e}")
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    articles = []
-    for item in soup.select(".vrwrap"):
-        h3 = item.select_one("h3 a")
-        if not h3:
-            continue
-        title = h3.get_text(strip=True)
-        link = h3.get("href", "").strip()
-        if not title or not link:
-            continue
-        summary_el = item.select_one(".txt-info, .space-txt, .star-wiki")
-        summary = summary_el.get_text(strip=True) if summary_el else ""
-        articles.append(RawArticle(
-            source="搜狗新闻", category="stock", title=title,
-            url=link, content=summary[:2000], language="zh",
-            published_at=None, stock_code="",
-        ))
-    return articles
-
-
 # ── 对外统一接口 ──
 
 def fetch_news_search(query: str, timeout: int = 15) -> list[RawArticle]:
-    """搜索新闻：头条优先，失败时 fallback 搜狗"""
+    """搜索新闻：今日头条"""
     articles = _fetch_toutiao(query, timeout)
-    if articles:
-        logger.info(f"[头条-{query}] 抓取到 {len(articles)} 篇")
-        return articles
-
-    articles = _fetch_sogou(query, timeout)
-    logger.info(f"[搜狗新闻-{query}] 抓取到 {len(articles)} 篇")
+    logger.info(f"[头条-{query}] 抓取到 {len(articles)} 篇")
     return articles
 
 
