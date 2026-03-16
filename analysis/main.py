@@ -6,7 +6,8 @@
   python -m analysis.main --stock 601789        # 个股基本面分析
   python -m analysis.main --stock 601789,000858 # 多只个股
   python -m analysis.main --all                 # 国际+国内+个股（stocks.txt）
-  python -m analysis.main --all-stocks          # 全量个股（la_pick），支持断点续跑
+  python -m analysis.main --all-stocks          # 全量个股（stock_basic 全市场），支持断点续跑
+  python -m analysis.main --all-la              # 选股池（la_pick），支持断点续跑
   python -m analysis.main --retry               # 重跑最近一次失败的股票
   python -m analysis.main --all-stocks --no-resume  # 强制全量重跑
 """
@@ -339,12 +340,14 @@ def _handle_result(session, fut, meta, run_id, run):
 
 # ── 辅助 ──
 
-def _lookup_name(code: str) -> str:
+def _lookup_name(code: str, cfg=None) -> str:
     import pymysql
     try:
-        conn = pymysql.connect(
-            host="localhost", user="root", password="root", db="my_stock",
-        )
+        kw = {"host": "localhost", "user": "root", "password": "root", "db": "my_stock"}
+        if cfg:
+            db = cfg.database
+            kw = {"host": db.host, "port": db.port, "user": db.user, "password": db.password, "db": "my_stock"}
+        conn = pymysql.connect(**kw)
         cur = conn.cursor()
         cur.execute("SELECT name FROM stock_basic WHERE symbol = %s LIMIT 1", (code,))
         row = cur.fetchone()
@@ -354,10 +357,28 @@ def _lookup_name(code: str) -> str:
         return code
 
 
-def _load_all_stocks() -> list[tuple[str, str]]:
+def _load_all_stocks(cfg) -> list[tuple[str, str]]:
+    """从 my_stock.stock_basic 读取全市场上市股票，按 symbol 排序"""
+    import pymysql
+    db = cfg.database
+    conn = pymysql.connect(host=db.host, port=db.port, user=db.user, password=db.password, db="my_stock")
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT symbol, name FROM stock_basic"
+        " WHERE list_status = 'L'"
+        " ORDER BY symbol"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    logger.info(f"[stock_basic] 读取到 {len(rows)} 只股票")
+    return [(r[0], r[1]) for r in rows]
+
+
+def _load_la_stocks(cfg) -> list[tuple[str, str]]:
     """从 my_stock.la_pick 读取选股池，按 code 排序（固定顺序，游标依赖此顺序）"""
     import pymysql
-    conn = pymysql.connect(host="localhost", user="root", password="root", db="my_stock")
+    db = cfg.database
+    conn = pymysql.connect(host=db.host, port=db.port, user=db.user, password=db.password, db="my_stock")
     cur = conn.cursor()
     cur.execute(
         "SELECT code, name FROM ("
@@ -383,7 +404,9 @@ def main():
     parser.add_argument("--all", action="store_true",
                         help="全部分析（国际+国内+stocks.txt个股，记录 run）")
     parser.add_argument("--all-stocks", action="store_true",
-                        help="全量个股分析（la_pick），记录 run，支持断点续跑")
+                        help="全量个股分析（stock_basic 全市场），记录 run，支持断点续跑")
+    parser.add_argument("--all-la", action="store_true",
+                        help="选股池分析（la_pick），记录 run，支持断点续跑")
     parser.add_argument("--retry", type=str, default=None, nargs="?", const="latest",
                         help="重跑失败的股票，可指定 run_id（默认最近一次）")
     parser.add_argument("--no-resume", action="store_true",
@@ -420,9 +443,22 @@ def main():
             time.sleep(DELAY)
             run_domestic(session, cfg.llm)
             time.sleep(DELAY)
-            codes_names = _load_all_stocks()
+            codes_names = _load_all_stocks(cfg)
             if codes_names:
                 run = _start_or_resume_batch(session, len(codes_names),
+                                             task_type="all_stocks",
+                                             force_new=args.no_resume)
+                run_stocks(session, cfg.llm, codes_names, run=run)
+
+        elif args.all_la:
+            run_global(session, cfg.llm)
+            time.sleep(DELAY)
+            run_domestic(session, cfg.llm)
+            time.sleep(DELAY)
+            codes_names = _load_la_stocks(cfg)
+            if codes_names:
+                run = _start_or_resume_batch(session, len(codes_names),
+                                             task_type="all_la",
                                              force_new=args.no_resume)
                 run_stocks(session, cfg.llm, codes_names, run=run)
 
@@ -434,7 +470,7 @@ def main():
             stocks = load_stocks(cfg)
             if stocks:
                 codes_names = sorted(
-                    [(s.code, s.name or _lookup_name(s.code)) for s in stocks],
+                    [(s.code, s.name or _lookup_name(s.code, cfg)) for s in stocks],
                     key=lambda x: x[0],
                 )
                 run = _start_or_resume_batch(session, len(codes_names),
@@ -448,7 +484,7 @@ def main():
                 run_domestic(session, cfg.llm)
             if args.stock:
                 codes = [c.strip() for c in args.stock.split(",") if c.strip()]
-                codes_names = [(c, _lookup_name(c)) for c in codes]
+                codes_names = [(c, _lookup_name(c, cfg)) for c in codes]
                 run_stocks(session, cfg.llm, codes_names)
 
             if not args.do_global and not args.domestic and not args.stock:
