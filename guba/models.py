@@ -19,14 +19,16 @@ class GubaSentiment(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     stock_code = Column(String(20), nullable=False)
     date = Column(Date, nullable=False, comment="采集日期")
-    score = Column(Float, nullable=False, comment="加权情绪得分 -1~+1")
+    score = Column(Float, nullable=False, comment="加权情绪得分 0-100，50为中性")
     post_count = Column(Integer, comment="当日帖子数")
     bull_count = Column(Integer, comment="看多帖子数")
     bear_count = Column(Integer, comment="看空帖子数")
     neutral_count = Column(Integer, comment="中性帖子数")
     total_read = Column(Integer, comment="总阅读量")
     total_comment = Column(Integer, comment="总评论数")
+    page1_timespan = Column(Float, comment="第一页帖子时间跨度（小时），越短越活跃")
     tier = Column(String(20), comment="采样区间（市场抽样时使用）")
+    popularity_rank = Column(Integer, comment="人气排名（市场抽样时记录）")
     created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (

@@ -17,10 +17,10 @@ from sqlalchemy import text
 
 from config import load_config, load_stocks
 from database import Database, batch_upsert, batch_insert_ignore
-from heat.models import PopularityRank, EmHotRankDetail, EmHotKeyword, BaiduHotSearch
+from heat.models import PopularityRank, EmHotRankDetail, EmHotKeyword
 from heat.fetcher import (
     fetch_popularity_page, fetch_hot_rank_detail_em,
-    fetch_hot_keyword_em, fetch_hot_search_baidu,
+    fetch_hot_keyword_em,
     POPULARITY_FILTERS, _to_ak_symbol,
 )
 
@@ -302,33 +302,6 @@ def run_init(session):
     )
 
 
-# ── 百度热搜：A股/港股/美股 Top12 ──
-
-def run_baidu(session):
-    """采集百度热搜 Top12，A股+港股+美股，今日+1小时两个维度"""
-    start = time.time()
-    today = datetime.now().strftime("%Y%m%d")
-
-    # 只采集"今日"维度入库（"1小时"数据波动大，意义不大）
-    all_rows = []
-    for market in ["A股", "港股", "美股"]:
-        data = fetch_hot_search_baidu(market=market, time="今日", date=today)
-        all_rows.extend(data)
-        time.sleep(DELAY)
-
-    if all_rows:
-        affected = batch_upsert(
-            session, BaiduHotSearch, all_rows,
-            update_cols=["stock_name", "change_rate", "heat"],
-        )
-        elapsed = time.time() - start
-        logger.info(
-            f"[百度热搜] 完成：{len(all_rows)} 条（A股+港股+美股），"
-            f"affected {affected}，耗时 {elapsed:.1f}s"
-        )
-    else:
-        logger.warning("[百度热搜] 未采集到数据")
-
 
 # ── 代理处理 ──
 
@@ -352,8 +325,6 @@ def main():
                         help="回溯历史趋势（366天，仅首次）")
     parser.add_argument("--keyword", action="store_true",
                         help="采集 Top100 热门关键词")
-    parser.add_argument("--baidu", action="store_true",
-                        help="百度热搜 Top12（A股/港股/美股）")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -371,10 +342,6 @@ def main():
             logger.info("========== 关键词采集开始 ==========")
             run_keyword(session)
             logger.info("========== 关键词采集完成 ==========")
-        elif args.baidu:
-            logger.info("========== 百度热搜采集开始 ==========")
-            run_baidu(session)
-            logger.info("========== 百度热搜采集完成 ==========")
         else:
             logger.info("========== 人气排名采集开始 ==========")
             run_popularity(session, cfg)

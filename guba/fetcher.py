@@ -104,6 +104,48 @@ def fetch_guba_posts(stock_code: str, max_pages: int = 3) -> list[dict]:
     return all_posts
 
 
+def fetch_page1_timespan(stock_code: str) -> float | None:
+    """取股吧第一页帖子，计算最新帖与最旧帖的时间跨度（小时）
+
+    跨度越短 = 发帖越密集 = 关注度越高。
+    例如第一页跨度 2 小时说明非常活跃，跨度 48 小时说明冷门。
+    返回 None 表示数据不足。
+    """
+    url = f"https://guba.eastmoney.com/list,{stock_code}.html"
+    try:
+        resp = cffi_req.get(url, impersonate="chrome", timeout=15)
+        if resp.status_code != 200:
+            return None
+    except Exception:
+        return None
+
+    match = re.search(r"var article_list=(\{.*?\});", resp.text, re.S)
+    if not match:
+        return None
+
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+    times = []
+    for p in data.get("re", []):
+        pub_str = p.get("post_publish_time", "")
+        if not pub_str:
+            continue
+        try:
+            times.append(datetime.strptime(pub_str, "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+
+    if len(times) < 2:
+        return None
+
+    span = (max(times) - min(times)).total_seconds() / 3600
+    logger.info(f"[股吧] {stock_code} 第一页时间跨度 {span:.1f}h（{len(times)} 条帖子）")
+    return round(span, 1)
+
+
 # ═══════════════════════════════════════════
 # LLM 情绪分类
 # ═══════════════════════════════════════════
@@ -132,42 +174,49 @@ def classify_posts(titles: list[str], llm_cfg: LLMConfig) -> list[int]:
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles))
     prompt = _CLASSIFY_PROMPT.format(titles=numbered)
 
-    try:
-        with httpx.Client(timeout=60) as client:
-            resp = client.post(
-                f"{llm_cfg.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {llm_cfg.api_key}"},
-                json={
-                    "model": llm_cfg.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": llm_cfg.max_tokens,
-                    "temperature": 0.1,
-                },
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            with httpx.Client(timeout=120) as client:
+                resp = client.post(
+                    f"{llm_cfg.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {llm_cfg.api_key}"},
+                    json={
+                        "model": llm_cfg.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": llm_cfg.max_tokens,
+                        "temperature": 0.1,
+                    },
+                )
+                resp.raise_for_status()
+                content = resp.json()["choices"][0]["message"]["content"].strip()
 
-        # 提取 JSON 数组（兼容 LLM 可能包裹在 markdown code block 中）
-        json_match = re.search(r"\[[\s\S]*?\]", content)
-        if not json_match:
-            logger.error(f"[LLM] 返回格式异常: {content[:200]}")
-            return [0] * len(titles)
+            # 提取 JSON 数组（兼容 LLM 可能包裹在 markdown code block 中）
+            json_match = re.search(r"\[[\s\S]*?\]", content)
+            if not json_match:
+                logger.error(f"[LLM] 返回格式异常: {content[:200]}")
+                return [0] * len(titles)
 
-        labels = json.loads(json_match.group())
+            labels = json.loads(json_match.group())
 
-        # 校验长度和取值
-        if len(labels) != len(titles):
-            logger.warning(f"[LLM] 返回 {len(labels)} 条，期望 {len(titles)} 条，截断/补齐")
-            labels = labels[:len(titles)]
-            labels.extend([0] * (len(titles) - len(labels)))
+            # 校验长度和取值
+            if len(labels) != len(titles):
+                logger.warning(f"[LLM] 返回 {len(labels)} 条，期望 {len(titles)} 条，截断/补齐")
+                labels = labels[:len(titles)]
+                labels.extend([0] * (len(titles) - len(labels)))
 
-        # 确保取值在 {-1, 0, 1}
-        labels = [x if x in (-1, 0, 1) else 0 for x in labels]
-        return labels
+            # 确保取值在 {-1, 0, 1}
+            labels = [x if x in (-1, 0, 1) else 0 for x in labels]
+            return labels
 
-    except Exception as e:
-        logger.error(f"[LLM] 分类失败: {e}")
-        return [0] * len(titles)
+        except Exception as e:
+            logger.warning(f"[LLM] 分类失败 (第{attempt}次): {e}")
+            if attempt < max_retries:
+                import time
+                time.sleep(5 * attempt)
+
+    logger.error(f"[LLM] 分类 {max_retries} 次均失败，放弃")
+    return [0] * len(titles)
 
 
 # ═══════════════════════════════════════════
@@ -227,10 +276,11 @@ def calc_sentiment(posts: list[dict], labels: list[int]) -> dict:
     bear_count = sum(1 for l in labels if l == -1)
     neutral_count = sum(1 for l in labels if l == 0)
 
-    # 加权情绪得分 = Σ(label × weight) / Σ(weight)
+    # 加权情绪得分：先算 -1~+1，再映射到 0~100（50为中性）
     weighted_sum = sum(labels[i] * weights[i] for i in range(n))
     weight_total = sum(weights)
-    score = round(weighted_sum / weight_total, 4) if weight_total > 0 else 0.0
+    raw = weighted_sum / weight_total if weight_total > 0 else 0.0
+    score = round((raw + 1) * 50, 1)  # -1→0, 0→50, +1→100
 
     return {
         "score": score,

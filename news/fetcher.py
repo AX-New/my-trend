@@ -1,28 +1,22 @@
-"""新闻采集 —— 能力层，无限流
+"""新闻采集 —— 能力层
 
+搜索引擎：今日头条（主） + 搜狗新闻（备），curl_cffi 绕反爬。
 每个函数是单次调用，调度层负责循环和间隔控制。
 """
 
-import json
+import hashlib
 import logging
 import re
-import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 
-import feedparser
-import httpx
-import trafilatura
+from bs4 import BeautifulSoup
+from curl_cffi import requests as cffi_req
 
-from config import SourceConfig, NetworkConfig, StockInfo
+from config import StockInfo
 
 logger = logging.getLogger(__name__)
-
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
 
 
 @dataclass
@@ -39,279 +33,134 @@ class RawArticle:
     dup_count: int = 1
 
 
-def _strip_html(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+# ── 共享 session ──
+
+_session: cffi_req.Session | None = None
 
 
-def _make_client(network: NetworkConfig, browser: bool = False) -> httpx.Client:
-    headers = {"User-Agent": _BROWSER_UA if browser else network.user_agent}
-    return httpx.Client(
-        timeout=network.timeout,
-        proxy=network.proxy or None,
-        follow_redirects=True,
-        headers=headers,
-    )
+def _get_session() -> cffi_req.Session:
+    """复用 session：保持 cookie + TLS 指纹一致"""
+    global _session
+    if _session is None:
+        _session = cffi_req.Session(impersonate="chrome120")
+    return _session
 
 
-# ── 正文提取 ──
+# ── 今日头条搜索 ──
 
-_MIN_CONTENT_LEN = 200
-
-
-def extract_full_text(url: str, network: NetworkConfig) -> str | None:
-    """访问文章 URL，用 trafilatura 提取正文"""
+def _fetch_toutiao(query: str, timeout: int = 15) -> list[RawArticle]:
+    """今日头条资讯搜索"""
     try:
-        with _make_client(network, browser=True) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            text = trafilatura.extract(resp.text, include_comments=False)
-            if text and len(text) > _MIN_CONTENT_LEN:
-                return text[:5000]
+        session = _get_session()
+        resp = session.get(
+            "https://so.toutiao.com/search",
+            params={"keyword": query, "pd": "information", "dvpf": "pc"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
     except Exception as e:
-        logger.debug(f"[正文提取] {url[:80]} 失败: {e}")
-    return None
-
-
-# ── RSS / JSON API ──
-
-def fetch_rss(source: SourceConfig, network: NetworkConfig) -> list[RawArticle]:
-    """从 RSS 源抓取文章列表"""
-    try:
-        with _make_client(network) as client:
-            resp = client.get(source.url)
-            resp.raise_for_status()
-    except Exception as e:
-        logger.error(f"[{source.name}] 请求失败: {e}")
+        logger.debug(f"[头条-{query}] 请求失败: {e}")
         return []
 
-    feed = feedparser.parse(resp.text)
+    soup = BeautifulSoup(resp.text, "html.parser")
     articles = []
-    for entry in feed.entries:
-        pub_time = None
-        if hasattr(entry, "published_parsed") and entry.published_parsed:
-            try:
-                pub_time = datetime(*entry.published_parsed[:6])
-            except Exception:
-                pass
-        content = ""
-        if hasattr(entry, "summary"):
-            content = entry.summary
-        elif hasattr(entry, "content") and entry.content:
-            content = entry.content[0].get("value", "")
-        content = _strip_html(content)
-
+    for item in soup.select("[data-i]"):
+        title_a = item.select_one(".result-content a") or item.select_one("a")
+        if not title_a:
+            continue
+        title = title_a.get_text(strip=True)
+        link = title_a.get("href", "").strip()
+        if not title or not link:
+            continue
+        summary = item.get_text(strip=True)[:2000]
         articles.append(RawArticle(
-            source=source.name,
-            category=source.category,
-            title=entry.get("title", "").strip(),
-            url=entry.get("link", "").strip(),
-            content=content[:2000],
-            language=source.language,
-            published_at=pub_time,
+            source="今日头条", category="stock", title=title,
+            url=link, content=summary, language="zh",
+            published_at=None, stock_code="",
         ))
-    logger.info(f"[{source.name}] 抓取到 {len(articles)} 篇")
     return articles
 
 
-def fetch_sina_api(source: SourceConfig, network: NetworkConfig) -> list[RawArticle]:
-    """从新浪财经 JSON API 抓取文章"""
+# ── 搜狗新闻搜索（备用） ──
+
+def _fetch_sogou(query: str, timeout: int = 15) -> list[RawArticle]:
+    """搜狗新闻搜索"""
     try:
-        with _make_client(network) as client:
-            resp = client.get(source.url)
-            resp.raise_for_status()
-            data = resp.json()
+        session = _get_session()
+        resp = session.get(
+            "https://news.sogou.com/news",
+            params={"query": query, "mode": 1},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
     except Exception as e:
-        logger.error(f"[{source.name}] 请求失败: {e}")
+        logger.debug(f"[搜狗新闻-{query}] 请求失败: {e}")
         return []
 
+    soup = BeautifulSoup(resp.text, "html.parser")
     articles = []
-    items = data.get("result", {}).get("data", [])
-    for item in items:
-        pub_time = None
-        ctime = item.get("ctime", "")
-        if ctime:
-            try:
-                pub_time = datetime.strptime(ctime, "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
+    for item in soup.select(".vrwrap"):
+        h3 = item.select_one("h3 a")
+        if not h3:
+            continue
+        title = h3.get_text(strip=True)
+        link = h3.get("href", "").strip()
+        if not title or not link:
+            continue
+        summary_el = item.select_one(".txt-info, .space-txt, .star-wiki")
+        summary = summary_el.get_text(strip=True) if summary_el else ""
         articles.append(RawArticle(
-            source=source.name,
-            category=source.category,
-            title=item.get("title", "").strip(),
-            url=item.get("url", "").strip(),
-            content=item.get("intro", "").strip()[:2000],
-            language=source.language,
-            published_at=pub_time,
+            source="搜狗新闻", category="stock", title=title,
+            url=link, content=summary[:2000], language="zh",
+            published_at=None, stock_code="",
         ))
-    logger.info(f"[{source.name}] 抓取到 {len(articles)} 篇")
     return articles
 
 
-def fetch_source(source: SourceConfig, network: NetworkConfig) -> list[RawArticle]:
-    if not source.enabled:
-        return []
-    if source.type == "json_api":
-        return fetch_sina_api(source, network)
-    return fetch_rss(source, network)
+# ── 对外统一接口 ──
 
+def fetch_news_search(query: str, timeout: int = 15) -> list[RawArticle]:
+    """搜索新闻：头条优先，失败时 fallback 搜狗"""
+    articles = _fetch_toutiao(query, timeout)
+    if articles:
+        logger.info(f"[头条-{query}] 抓取到 {len(articles)} 篇")
+        return articles
 
-# ── 个股搜索（单次调用） ──
-
-def fetch_google_news(query: str, network: NetworkConfig,
-                      language: str = "zh") -> list[RawArticle]:
-    """Google News RSS 搜索（需要 proxy）"""
-    if language == "zh":
-        params = urllib.parse.urlencode({
-            "q": query, "hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans",
-        })
-    else:
-        params = urllib.parse.urlencode({
-            "q": query, "hl": "en", "gl": "US", "ceid": "US:en",
-        })
-    url = f"https://news.google.com/rss/search?{params}"
-
-    try:
-        with _make_client(network) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-    except Exception as e:
-        logger.warning(f"[GoogleNews-{query}] 请求失败: {e}")
-        return []
-
-    feed = feedparser.parse(resp.text)
-    articles = []
-    for entry in feed.entries[:15]:
-        pub_time = None
-        if hasattr(entry, "published_parsed") and entry.published_parsed:
-            try:
-                pub_time = datetime(*entry.published_parsed[:6])
-            except Exception:
-                pass
-        articles.append(RawArticle(
-            source="GoogleNews",
-            category="stock",
-            title=entry.get("title", "").strip(),
-            url=entry.get("link", "").strip(),
-            content=_strip_html(entry.get("summary", ""))[:2000],
-            language=language,
-            published_at=pub_time,
-        ))
-    logger.info(f"[GoogleNews-{query}] 抓取到 {len(articles)} 篇")
+    articles = _fetch_sogou(query, timeout)
+    logger.info(f"[搜狗新闻-{query}] 抓取到 {len(articles)} 篇")
     return articles
 
 
-def fetch_stock_eastmoney(query: str, network: NetworkConfig) -> list[RawArticle]:
-    """东方财富搜索 API (JSONP)"""
-    articles = []
+# ── 个股搜索词生成 ──
+
+def _lookup_stock_name(code: str) -> str | None:
+    """从 my_stock.stock_basic 查股票简称"""
+    import pymysql
     try:
-        param = json.dumps({
-            "uid": "",
-            "keyword": query,
-            "type": ["cmsArticleWebOld"],
-            "client": "web",
-            "clientType": "web",
-            "clientVersion": "curr",
-            "param": {
-                "cmsArticleWebOld": {
-                    "searchScope": "default",
-                    "sort": "default",
-                    "pageIndex": 1,
-                    "pageSize": 20,
-                }
-            },
-        }, separators=(",", ":"))
-        url = f"https://search-api-web.eastmoney.com/search/jsonp?cb=cb&param={urllib.parse.quote(param)}"
-
-        with _make_client(network, browser=True) as client:
-            client.headers["Referer"] = "https://so.eastmoney.com/"
-            resp = client.get(url)
-            resp.raise_for_status()
-            text = resp.text.strip()
-            json_str = re.sub(r'^cb\(|\);?$', '', text)
-            data = json.loads(json_str)
-
-        cms = data.get("result", {}).get("cmsArticleWebOld", [])
-        items = cms if isinstance(cms, list) else cms.get("list", [])
-        for item in items[:15]:
-            title = item.get("title", "")
-            art_url = item.get("url", "") or item.get("mediaUrl", "")
-            if not title or not art_url:
-                continue
-            pub_time = None
-            date_str = item.get("date", "")
-            if date_str:
-                try:
-                    pub_time = datetime.strptime(date_str[:19], "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
-            articles.append(RawArticle(
-                source="东方财富",
-                category="stock",
-                title=_strip_html(title),
-                url=art_url.strip(),
-                content=_strip_html(item.get("content", ""))[:2000],
-                language="zh",
-                published_at=pub_time,
-            ))
+        conn = pymysql.connect(
+            host="localhost", user="root", password="root", db="my_stock",
+        )
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name FROM stock_basic WHERE symbol = %s LIMIT 1", (code,)
+        )
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else None
     except Exception as e:
-        logger.warning(f"[东方财富-{query}] 失败: {e}")
-
-    logger.info(f"[东方财富-{query}] 抓取到 {len(articles)} 篇")
-    return articles
-
-
-def fetch_stock_sina(query: str, network: NetworkConfig) -> list[RawArticle]:
-    """新浪财经搜索"""
-    source = SourceConfig(
-        name="新浪财经",
-        category="stock",
-        url=f"https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k={urllib.parse.quote(query)}&num=20&page=1",
-        language="zh",
-        type="json_api",
-    )
-    return fetch_sina_api(source, network)
-
-
-def fetch_global_news_em() -> list[dict]:
-    """东方财富24小时全球资讯（stock_info_global_em），返回 ~200 条"""
-    import akshare as ak
-    import hashlib
-    try:
-        df = ak.stock_info_global_em()
-        if df is None or df.empty:
-            return []
-        results = []
-        for _, row in df.iterrows():
-            url = str(row.get("链接", "")).strip()
-            if not url:
-                continue
-            pub_time = None
-            pub_str = str(row.get("发布时间", "")).strip()
-            if pub_str:
-                try:
-                    pub_time = datetime.strptime(pub_str, "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
-            results.append({
-                "title": str(row.get("标题", "")).strip(),
-                "summary": str(row.get("摘要", "")).strip()[:5000],
-                "url": url,
-                "url_hash": hashlib.sha256(url.encode()).hexdigest(),
-                "published_at": pub_time,
-            })
-        logger.info(f"[24小时资讯] 获取 {len(results)} 条")
-        return results
-    except Exception as e:
-        logger.error(f"[24小时资讯] 采集失败: {e}")
-        return []
+        logger.warning(f"[stock_basic] 查询 {code} 失败: {e}")
+        return None
 
 
 def generate_stock_queries(stock: StockInfo) -> list[str]:
-    """股票代码 + 公司名，各搜一次"""
-    queries = [stock.code]
-    if stock.name:
-        queries.append(stock.name)
-    return queries
+    """公司名 + 单关键词"""
+    name = stock.name or _lookup_stock_name(stock.code) or stock.code
+    return [
+        name,               # 综合新闻
+        f"{name} 项目",      # 项目动态
+        f"{name} 利润",      # 盈利情况
+        f"{name} 前景",      # 发展前景
+    ]
 
 
 # ── 去重 ──

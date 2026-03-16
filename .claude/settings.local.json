@@ -1,17 +1,19 @@
 {
   "permissions": {
     "allow": [
-      "Bash(*)",
       "Read(*)",
-      "Write(*)",
       "Edit(*)",
-      "Glob(*)",
+      "Write(*)",
       "Grep(*)",
-      "WebFetch(*)",
-      "WebSearch(*)",
-      "mcp__*",
-      "Bash(cd:*)",
-      "mcp__plugin_context7_context7__resolve-library-id"
+      "Glob(*)",
+      "Bash(*)",
+      "Agent(*)",
+      "mcp__sqlite__read_query",
+      "mcp__sqlite__write_query",
+      "mcp__sqlite__list_tables",
+      "mcp__sqlite__describe_table",
+      "mcp__sqlite__append_insight",
+      "mcp__sqlite__create_table"
     ]
   }
 }
