@@ -26,7 +26,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("news")
 
-DELAY = 1
+import random
+
+DELAY_MIN = 10
+DELAY_MAX = 20
+MAX_RETRIES = 3
 
 
 def cleanup_old_articles(session, days: int = 7):
@@ -39,11 +43,27 @@ def cleanup_old_articles(session, days: int = 7):
 
 
 def _fetch_stock_news(code: str, queries: list[str]) -> list[RawArticle]:
-    """对一只股票的所有搜索词搜索新闻（每次间隔 1s）"""
+    """对一只股票的所有搜索词搜索新闻（重试+自适应退避）"""
     all_articles = []
+    consecutive_empty = 0
     for query in queries:
-        all_articles.extend(fetch_news_search(query))
-        time.sleep(DELAY)
+        results = []
+        for attempt in range(1, MAX_RETRIES + 1):
+            results = fetch_news_search(query)
+            if results:
+                break
+            wait = random.uniform(DELAY_MIN, DELAY_MAX) * (1 + attempt)
+            logger.info(f"[{query}] 空结果（第{attempt}次），退避 {wait:.0f}s")
+            time.sleep(wait)
+        all_articles.extend(results)
+        if results:
+            consecutive_empty = 0
+        else:
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                logger.warning(f"[{code}] 连续 {consecutive_empty} 个关键词为空，疑似限流，中断搜索")
+                break
+        time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
     for art in all_articles:
         art.stock_code = code

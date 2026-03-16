@@ -18,8 +18,8 @@ from config import LLMConfig
 
 logger = logging.getLogger(__name__)
 
-DELAY_MIN = 3
-DELAY_MAX = 8
+DELAY_MIN = 10
+DELAY_MAX = 20
 
 # ── 日期解析 ──
 
@@ -167,11 +167,28 @@ def _format_news(items: list[dict], max_count: int = 30) -> str:
     return "\n\n".join(lines)
 
 
-def _collect_news(queries: list[str], max_count: int = 30) -> str:
-    """多关键词搜索 → 去重 → 按时间排序 → 拼接文本（随机 3-8s 间隔）"""
+def _collect_news(queries: list[str], max_count: int = 30,
+                   max_retries: int = 3) -> str:
+    """多关键词搜索 → 去重 → 按时间排序 → 拼接文本（空结果重试+递增退避）"""
     all_news = []
+    consecutive_empty = 0
     for q in queries:
-        all_news.extend(_search(q))
+        results = []
+        for attempt in range(1, max_retries + 1):
+            results = _search(q)
+            if results:
+                break
+            wait = random.uniform(DELAY_MIN, DELAY_MAX) * (1 + attempt)
+            logger.info(f"[{q}] 空结果（第{attempt}次），退避 {wait:.0f}s")
+            time.sleep(wait)
+        all_news.extend(results)
+        if results:
+            consecutive_empty = 0
+        else:
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                logger.warning(f"连续 {consecutive_empty} 个关键词为空，疑似限流，中断搜索")
+                break
         time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
     unique = _dedup_news(all_news)

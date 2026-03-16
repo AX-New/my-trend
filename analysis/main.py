@@ -37,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("analysis")
 
-DELAY = 1
+DELAY = 5
 MAX_LLM_WORKERS = 3
 # 连续搜索失败退避：连续 N 只无新闻则暂停，避免被限流
 EMPTY_STREAK_THRESHOLD = 5   # 连续空结果触发退避
@@ -264,7 +264,7 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
         global_i = base_cursor + i + 1
         logger.info(f"[{code} {name}]（{global_i}/{run.total_count if run else total}）搜索新闻...")
 
-        queries = [name, f"{name} 项目", f"{name} 利润", f"{name} 行业前景", f"{name} 产品"]
+        queries = [name, f"{name} 项目 利润", f"{name} 行业前景 产品"]
         articles = _collect_news(queries, max_count=30)
 
         if articles:
