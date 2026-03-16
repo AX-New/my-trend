@@ -54,7 +54,7 @@ def _fetch_toutiao(query: str, timeout: int = 15) -> list[RawArticle]:
         session = _get_session()
         resp = session.get(
             "https://so.toutiao.com/search",
-            params={"keyword": query, "pd": "information", "dvpf": "pc"},
+            params={"keyword": query, "pd": "information", "dvpf": "pc", "count": 20},
             timeout=timeout,
         )
         resp.raise_for_status()
@@ -114,10 +114,7 @@ def _lookup_stock_name(code: str) -> str | None:
 def generate_stock_queries(stock: StockInfo) -> list[str]:
     """公司名 + 组合关键词（减少请求次数）"""
     name = stock.name or _lookup_stock_name(stock.code) or stock.code
-    return [
-        name,                          # 综合新闻
-        f"{name} 项目 利润 前景",        # 组合搜索
-    ]
+    return [name, f"{name} 项目 利润 前景"]
 
 
 # ── 去重 ──

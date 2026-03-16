@@ -28,8 +28,8 @@ logger = logging.getLogger("news")
 
 import random
 
-DELAY_MIN = 10
-DELAY_MAX = 20
+DELAY_MIN = 20
+DELAY_MAX = 30
 MAX_RETRIES = 3
 
 
@@ -60,7 +60,7 @@ def _fetch_stock_news(code: str, queries: list[str]) -> list[RawArticle]:
             consecutive_empty = 0
         else:
             consecutive_empty += 1
-            if consecutive_empty >= 3:
+            if consecutive_empty >= 2:
                 logger.warning(f"[{code}] 连续 {consecutive_empty} 个关键词为空，疑似限流，中断搜索")
                 break
         time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))

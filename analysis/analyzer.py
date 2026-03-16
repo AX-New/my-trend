@@ -18,8 +18,8 @@ from config import LLMConfig
 
 logger = logging.getLogger(__name__)
 
-DELAY_MIN = 10
-DELAY_MAX = 20
+DELAY_MIN = 20
+DELAY_MAX = 30
 
 # ── 日期解析 ──
 
@@ -92,7 +92,7 @@ def _search_toutiao(query: str, timeout: int = 15) -> list[dict]:
         session = _get_session()
         resp = session.get(
             "https://so.toutiao.com/search",
-            params={"keyword": query, "pd": "information", "dvpf": "pc"},
+            params={"keyword": query, "pd": "information", "dvpf": "pc", "count": 20},
             timeout=timeout,
         )
         resp.raise_for_status()
@@ -186,7 +186,7 @@ def _collect_news(queries: list[str], max_count: int = 30,
             consecutive_empty = 0
         else:
             consecutive_empty += 1
-            if consecutive_empty >= 3:
+            if consecutive_empty >= 2:
                 logger.warning(f"连续 {consecutive_empty} 个关键词为空，疑似限流，中断搜索")
                 break
         time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))

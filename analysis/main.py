@@ -50,7 +50,7 @@ _SOURCE = platform.node()[:50]
 # ── run 管理（游标模式）──
 
 def _gen_run_id() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
 
 def _find_active_run(session, task_type: str = "analysis") -> AnalysisRun | None:
@@ -264,8 +264,8 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
         global_i = base_cursor + i + 1
         logger.info(f"[{code} {name}]（{global_i}/{run.total_count if run else total}）搜索新闻...")
 
-        queries = [name, f"{name} 项目 利润", f"{name} 行业前景 产品"]
-        articles = _collect_news(queries, max_count=30)
+        queries = [name, f"{name} 项目 利润 行业前景 产品"]
+        articles = _collect_news(queries, max_count=40)
 
         if articles:
             empty_streak = 0
