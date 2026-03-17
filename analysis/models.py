@@ -26,6 +26,7 @@ class AnalysisRun(Base):
     total_count = Column(Integer, default=0, comment="总股票数")
     done_cursor = Column(Integer, default=0, comment="已完成数（即下次从第 done_cursor 只开始）")
     fail_count = Column(Integer, default=0, comment="失败数")
+    eval_date = Column(String(20), comment="数据日期（la模式为la_pick.eval_date）")
     source = Column(String(50), comment="来源标识，用主机名区分")
     started_at = Column(DateTime, default=datetime.now)
     finished_at = Column(DateTime, comment="完成时间")

@@ -15,11 +15,12 @@ from curl_cffi import requests as cffi_req
 from openai import OpenAI
 
 from config import LLMConfig
+from clash_proxy import rotate_proxy, restore_auto
 
 logger = logging.getLogger(__name__)
 
-DELAY_MIN = 20
-DELAY_MAX = 30
+DELAY_MIN = 5
+DELAY_MAX = 10
 
 # ── 日期解析 ──
 
@@ -78,39 +79,51 @@ def _parse_date_str(date_str: str) -> datetime | None:
 
 CLASH_PROXY = "http://127.0.0.1:7890"
 
-_session_direct: cffi_req.Session | None = None
-_session_proxy: cffi_req.Session | None = None
+_session: cffi_req.Session | None = None
+
+MAX_EMPTY_RETRIES = 3  # 空结果最多轮换次数
 
 
-def _get_session(use_proxy: bool = False) -> cffi_req.Session:
-    global _session_direct, _session_proxy
-    if use_proxy:
-        if _session_proxy is None:
-            _session_proxy = cffi_req.Session(impersonate="chrome120", proxy=CLASH_PROXY)
-        return _session_proxy
-    else:
-        if _session_direct is None:
-            _session_direct = cffi_req.Session(impersonate="chrome120", proxy="")
-        return _session_direct
+def _get_session() -> cffi_req.Session:
+    global _session
+    if _session is None:
+        _session = cffi_req.Session(impersonate="chrome120", proxy=CLASH_PROXY)
+    return _session
 
 
-def _search_toutiao(query: str, timeout: int = 15, use_proxy: bool = False) -> list[dict]:
+def _reset_session():
+    """换IP后重建session，清掉cookie和连接"""
+    global _session
+    if _session is not None:
+        _session.close()
+        _session = None
+
+
+def _search_toutiao(query: str, timeout: int = 15) -> list[dict]:
     """头条搜索，返回 [{"title": ..., "summary": ..., "date_str": ..., "date": ...}, ...]"""
-    try:
-        session = _get_session(use_proxy)
-        resp = session.get(
-            "https://so.toutiao.com/search",
-            params={"keyword": query, "pd": "information", "dvpf": "pc", "count": 20},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.warning(f"[头条-{query}] 失败: {e}")
-        return []
+    session = _get_session()
+    resp = session.get(
+        "https://so.toutiao.com/search",
+        params={"keyword": query, "pd": "information", "dvpf": "pc", "count": 20},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+    items = soup.select("[data-i]")
+
+    if not items:
+        # 诊断：区分限流/验证码 vs 真的无结果
+        page_text = soup.get_text(strip=True)[:300]
+        logger.warning(
+            f"[头条-{query}] 页面无 [data-i] 元素 | "
+            f"status={resp.status_code} len={len(html)} | "
+            f"页面内容: {page_text}"
+        )
+
     results = []
-    for item in soup.select("[data-i]"):
+    for item in items:
         a = item.select_one(".result-content a") or item.select_one("a")
         if not a:
             continue
@@ -118,13 +131,11 @@ def _search_toutiao(query: str, timeout: int = 15, use_proxy: bool = False) -> l
         text = item.get_text(strip=True)
         summary = text[len(title):].strip() if title and text.startswith(title) else text
 
-        # 提取时间信息
         date_str = ""
         time_el = item.select_one("span[class*='time'], span[class*='date'], .text-time")
         if time_el:
             date_str = time_el.get_text(strip=True)
         if not date_str:
-            # 从全文提取时间模式
             for pattern in [r'\d+分钟前', r'\d+小时前', r'\d+天前', r'昨天', r'前天',
                             r'\d{4}[-/]\d{1,2}[-/]\d{1,2}', r'\d{1,2}月\d{1,2}日']:
                 m = re.search(pattern, text)
@@ -141,49 +152,37 @@ def _search_toutiao(query: str, timeout: int = 15, use_proxy: bool = False) -> l
     return results
 
 
-def _search_baidu(query: str, timeout: int = 15) -> list[dict]:
-    """百度资讯搜索（降级备用）"""
-    try:
-        session = _get_session(use_proxy=False)
-        resp = session.get(
-            "https://www.baidu.com/s",
-            params={"wd": query, "tn": "news", "rtt": 1, "bsst": 1},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.warning(f"[百度-{query}] 失败: {e}")
-        return []
+def _search(query: str, timeout: int = 15) -> list[dict]:
+    """搜索头条，请求失败时轮换IP重试（无上限），空结果最多轮换 MAX_EMPTY_RETRIES 次"""
+    empty_retries = 0
+    is_first = True
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    results = []
-    for item in soup.select(".result-op, .result"):
-        a = item.select_one("h3 a")
-        if not a:
-            continue
-        title = a.get_text(strip=True)
-        summary_el = item.select_one(".c-summary, .c-abstract, .content-right_8Zs40")
-        summary = summary_el.get_text(strip=True) if summary_el else ""
+    while True:
+        try:
+            results = _search_toutiao(query, timeout)
+            if results:
+                suffix = "" if is_first else " (切换后)"
+                logger.info(f"[头条-{query}] {len(results)} 条{suffix}")
+                return results
+            # 空结果：可能是限流，也可能确实没结果
+            empty_retries += 1
+            if empty_retries > MAX_EMPTY_RETRIES:
+                logger.warning(f"[头条-{query}] 连续 {MAX_EMPTY_RETRIES} 次空结果，跳过")
+                return []
+            logger.warning(f"[头条-{query}] 0 条结果 ({empty_retries}/{MAX_EMPTY_RETRIES})，轮换IP重试...")
+        except Exception as e:
+            logger.warning(f"[头条-{query}] 请求失败: {e}，轮换IP重试...")
 
-        date_str = ""
-        time_el = item.select_one(".c-color-gray, .c-color-gray2, .news-source span")
-        if time_el:
-            date_str = time_el.get_text(strip=True)
+        # 轮换IP + 重建session
+        try:
+            new_node = rotate_proxy()
+        except RuntimeError:
+            raise RuntimeError(f"[{query}] 所有代理节点均不可用")
 
-        results.append({
-            "title": title,
-            "summary": summary[:200],
-            "date_str": date_str,
-            "date": _parse_date_str(date_str),
-        })
-    return results
-
-
-def _search(query: str, timeout: int = 15, use_proxy: bool = False) -> list[dict]:
-    """搜索新闻：今日头条"""
-    results = _search_toutiao(query, timeout, use_proxy)
-    logger.info(f"[头条-{query}] {len(results)} 条{' (代理)' if use_proxy else ''}")
-    return results
+        _reset_session()
+        logger.info(f"[代理切换] -> {new_node}（已重建session），等待 {DELAY_MIN}-{DELAY_MAX}s 后重试 [{query}]")
+        time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+        is_first = False
 
 
 def _dedup_news(items: list[dict]) -> list[dict]:
@@ -213,42 +212,11 @@ def _format_news(items: list[dict], max_count: int = 30) -> str:
     return "\n\n".join(lines)
 
 
-_current_proxy = False  # 当前主力 IP：False=直连，True=代理
-_use_baidu = False      # 一旦降级百度就固定，跨调用保持
-
-
 def _collect_news(queries: list[str], max_count: int = 30) -> str:
-    """多关键词搜索，三级降级：直连/代理头条 → 百度。主力空了切另一个，都空试百度。
-    一旦降级百度就固定使用百度（跨调用保持），百度也失败则停止。"""
-    global _current_proxy, _use_baidu
+    """多关键词搜索头条，失败时轮换IP重试，所有IP耗尽抛异常"""
     all_news = []
     for q in queries:
-        if _use_baidu:
-            # 已降级百度，固定使用百度
-            results = _search_baidu(q)
-            logger.info(f"[百度-{q}] {len(results)} 条")
-            if not results:
-                # 百度也空，返空，由调用方退出
-                return ""
-        else:
-            # 1. 主力 IP 搜头条
-            results = _search(q, use_proxy=_current_proxy)
-            if not results:
-                # 2. 切到另一个 IP 搜头条，先等待正常间隔
-                _current_proxy = not _current_proxy
-                logger.info(f"切换到{'代理' if _current_proxy else '直连'}，等待后重试...")
-                time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-                results = _search(q, use_proxy=_current_proxy)
-            if not results:
-                # 3. 头条双 IP 都空，降级百度（后续固定百度）
-                logger.info(f"头条双 IP 均空，降级百度搜索（后续固定百度）")
-                _use_baidu = True
-                time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-                results = _search_baidu(q)
-                logger.info(f"[百度-{q}] {len(results)} 条")
-                if not results:
-                    # 百度也空，返空，由调用方退出
-                    return ""
+        results = _search(q)
         all_news.extend(results)
         time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 

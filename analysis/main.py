@@ -31,6 +31,7 @@ from analysis.analyzer import (
     analyze_global, analyze_domestic,
     _collect_news, _call_llm, STOCK_PROMPT, LLMConfig,
 )
+from clash_proxy import restore_auto
 
 _LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 _LOG_DIR.mkdir(exist_ok=True)
@@ -70,7 +71,8 @@ def _find_active_run(session, task_type: str = "analysis") -> AnalysisRun | None
     ).order_by(AnalysisRun.started_at.desc()).first()
 
 
-def _create_run(session, total: int, task_type: str = "analysis") -> AnalysisRun:
+def _create_run(session, total: int, task_type: str = "analysis",
+                eval_date: str = None) -> AnalysisRun:
     run = AnalysisRun(
         run_id=_gen_run_id(),
         task_type=task_type,
@@ -78,11 +80,12 @@ def _create_run(session, total: int, task_type: str = "analysis") -> AnalysisRun
         total_count=total,
         done_cursor=0,
         fail_count=0,
+        eval_date=eval_date,
         source=_SOURCE,
     )
     session.add(run)
     session.commit()
-    logger.info(f"[RUN] 新建 {run.run_id}（{task_type}，{total} 只，来源={_SOURCE}）")
+    logger.info(f"[RUN] 新建 {run.run_id}（{task_type}，{total} 只，eval_date={eval_date}，来源={_SOURCE}）")
     return run
 
 
@@ -106,13 +109,17 @@ def _finish_run(session, run: AnalysisRun):
 
 def _start_or_resume_batch(session, total: int,
                            task_type: str = "analysis",
-                           force_new: bool = False) -> AnalysisRun:
-    """恢复未完成的 run 或创建新 run"""
+                           force_new: bool = False,
+                           eval_date: str = None) -> AnalysisRun:
+    """恢复未完成的 run 或创建新 run。eval_date 不一致时自动中断旧 run 并新建。"""
     if not force_new:
         active = _find_active_run(session, task_type)
         if active:
-            logger.info(f"[RUN] 恢复 {active.run_id}（cursor={active.done_cursor}/{active.total_count}）")
-            return active
+            if eval_date and str(active.eval_date) != str(eval_date):
+                logger.info(f"[RUN] eval_date 不一致（旧={active.eval_date} 新={eval_date}），中断旧 run 并新建")
+            else:
+                logger.info(f"[RUN] 恢复 {active.run_id}（cursor={active.done_cursor}/{active.total_count}，eval_date={active.eval_date}）")
+                return active
 
     # 中断旧 run
     old_runs = session.query(AnalysisRun).filter(
@@ -125,12 +132,13 @@ def _start_or_resume_batch(session, total: int,
         r.finished_at = datetime.now()
     session.commit()
 
-    return _create_run(session, total, task_type)
+    return _create_run(session, total, task_type, eval_date=eval_date)
 
 
 # ── 失败记录 ──
 
-def _record_failure(session, run_id: str, code: str, name: str, error: str):
+def _record_failure(session, run_id: str, code: str, name: str, error: str,
+                    analysis_date: date = None):
     existing = session.query(AnalysisFailure).filter(
         AnalysisFailure.stock_code == code,
         AnalysisFailure.run_id == run_id,
@@ -142,7 +150,7 @@ def _record_failure(session, run_id: str, code: str, name: str, error: str):
     else:
         session.add(AnalysisFailure(
             stock_code=code, stock_name=name, run_id=run_id,
-            date=date.today(), stage="stock", error=str(error)[:500],
+            date=analysis_date or date.today(), stage="stock", error=str(error)[:500],
         ))
     session.commit()
 
@@ -172,7 +180,8 @@ def _get_failed_codes(session, run_id: str) -> list[tuple[str, str]]:
 # ── 保存结果 ──
 
 def _save(session, analysis_type: str, code: str, name: str,
-          data: dict, article_count: int = 0, run_id: str = None):
+          data: dict, article_count: int = 0, run_id: str = None,
+          analysis_date: date = None):
     sentiment = data.get("sentiment", "")
     summary = data.get("summary", "")
     score = data.get("score", 0.0)
@@ -182,7 +191,7 @@ def _save(session, analysis_type: str, code: str, name: str,
         "analysis_type": analysis_type,
         "stock_code": code,
         "stock_name": name,
-        "date": date.today(),
+        "date": analysis_date or date.today(),
         "article_count": article_count,
         "sentiment": sentiment,
         "summary": summary,
@@ -235,7 +244,7 @@ def _llm_task(code, name, prompt, article_count, llm, semaphore):
 
 
 def run_stocks(session, llm, codes_names: list[tuple[str, str]],
-               run: AnalysisRun = None):
+               run: AnalysisRun = None, analysis_date: date = None):
     """个股基本面分析：串行搜索新闻，LLM 并发（滑动窗口）。
 
     主线程按顺序搜索新闻，搜到后提交 LLM 到线程池（Semaphore 控制并发上限）。
@@ -245,6 +254,7 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
       - codes_names 已按 code 排序（固定顺序）
       - 从 run.done_cursor 位置开始
     run 为 None 时直接跑全部（--stock 单股模式）。
+    analysis_date: 指定分析日期（la 模式用 eval_date），默认 date.today()。
     """
     run_id = run.run_id if run else None
 
@@ -287,34 +297,42 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
         logger.info(f"[{code} {name}]（{global_i}/{run.total_count if run else total}）搜索新闻...")
 
         queries = [name, f"{name} 项目 利润 行业前景 产品"]
-        articles = _collect_news(queries, max_count=40)
-
-        if articles:
-            article_count = len(articles.strip().split("\n\n"))
-            prompt = STOCK_PROMPT.format(
-                code=code, name=name, articles=articles, today=date.today(),
-            )
-            semaphore.acquire()
-            fut = executor.submit(_llm_task, code, name, prompt, article_count, llm, semaphore)
-            futures[fut] = (code, name, i)
-            logger.info(f"[{code}] 新闻 {article_count} 条，已提交 LLM")
-        else:
-            # 搜索无结果也算完成（不需要 LLM）
-            logger.warning(f"[{code}] 全部搜索源无结果，退出等待 watchdog 拉起")
+        try:
+            articles = _collect_news(queries, max_count=40)
+        except RuntimeError as e:
+            logger.error(f"[{code}] 所有代理节点耗尽: {e}")
             if run:
-                _record_failure(session, run_id, code, name, "搜索无结果")
+                _record_failure(session, run_id, code, name, str(e), analysis_date)
                 _inc_fail(session, run)
                 done_flags[i] = True
                 _try_advance_cursor()
             stopped_early = True
             break
 
+        if articles:
+            article_count = len(articles.strip().split("\n\n"))
+            prompt = STOCK_PROMPT.format(
+                code=code, name=name, articles=articles,
+                today=analysis_date or date.today(),
+            )
+            semaphore.acquire()
+            fut = executor.submit(_llm_task, code, name, prompt, article_count, llm, semaphore)
+            futures[fut] = (code, name, i)
+            logger.info(f"[{code}] 新闻 {article_count} 条，已提交 LLM")
+        else:
+            logger.warning(f"[{code}] 搜索无结果，跳过")
+            if run:
+                _record_failure(session, run_id, code, name, "搜索无结果", analysis_date)
+                _inc_fail(session, run)
+                done_flags[i] = True
+                _try_advance_cursor()
+
         time.sleep(DELAY)
 
         # 收割已完成的 future，标记完成并推进游标
         for fut in [f for f in futures if f.done()]:
             code_f, name_f, idx = futures.pop(fut)
-            _handle_result(session, fut, (code_f, name_f), run_id, run)
+            _handle_result(session, fut, (code_f, name_f), run_id, run, analysis_date)
             done_flags[idx] = True
         _try_advance_cursor()
 
@@ -322,11 +340,12 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
     logger.info(f"搜索完毕，等待 {len(futures)} 个 LLM 任务完成...")
     for fut in as_completed(futures):
         code_f, name_f, idx = futures[fut]
-        _handle_result(session, fut, (code_f, name_f), run_id, run)
+        _handle_result(session, fut, (code_f, name_f), run_id, run, analysis_date)
         done_flags[idx] = True
         _try_advance_cursor()
 
     executor.shutdown(wait=False)
+    restore_auto()
 
     if run:
         if stopped_early:
@@ -337,7 +356,7 @@ def run_stocks(session, llm, codes_names: list[tuple[str, str]],
     logger.info("========== 基本面分析完成 ==========")
 
 
-def _handle_result(session, fut, meta, run_id, run):
+def _handle_result(session, fut, meta, run_id, run, analysis_date=None):
     """处理 LLM future 结果"""
     code, name = meta
     try:
@@ -345,20 +364,21 @@ def _handle_result(session, fut, meta, run_id, run):
     except Exception as e:
         logger.error(f"[{code}] LLM 异常: {e}")
         if run:
-            _record_failure(session, run_id, code, name, str(e))
+            _record_failure(session, run_id, code, name, str(e), analysis_date)
             _inc_fail(session, run)
         return
 
     data = result["data"]
     if data:
-        _save(session, "stock", code, name, data, result["count"], run_id=run_id)
+        _save(session, "stock", code, name, data, result["count"],
+              run_id=run_id, analysis_date=analysis_date)
         if run:
             _resolve_failure(session, run_id, code)
         logger.info(f"[{code}] 基本面: {data.get('summary', '')[:80]}")
     else:
         logger.warning(f"[{code}] LLM 返回空结果")
         if run:
-            _record_failure(session, run_id, code, name, "LLM返回空结果")
+            _record_failure(session, run_id, code, name, "LLM返回空结果", analysis_date)
             _inc_fail(session, run)
 
 
@@ -398,23 +418,27 @@ def _load_all_stocks(cfg) -> list[tuple[str, str]]:
     return [(r[0], r[1]) for r in rows]
 
 
-def _load_la_stocks(cfg) -> list[tuple[str, str]]:
-    """从 my_stock.la_pick 读取最新日期的选股池，按 code 排序（固定顺序，游标依赖此顺序）"""
+def _load_la_stocks(cfg) -> tuple[date, list[tuple[str, str]]]:
+    """从 my_stock.la_pick 读取最新日期的选股池，返回 (eval_date, [(code, name)])"""
     import pymysql
     db = cfg.database
     conn = pymysql.connect(host=db.host, port=db.port, user=db.user, password=db.password, db="my_stock")
     cur = conn.cursor()
+    cur.execute("SELECT MAX(eval_date) FROM la_pick")
+    eval_date = cur.fetchone()[0]
+    if not eval_date:
+        conn.close()
+        logger.warning("[la_pick] 表为空，无数据")
+        return None, []
     cur.execute(
-        "SELECT code, name FROM ("
-        "  SELECT DISTINCT SUBSTRING_INDEX(ts_code, '.', 1) AS code, stock_name AS name"
-        "  FROM la_pick"
-        "  WHERE eval_date = (SELECT MAX(eval_date) FROM la_pick)"
-        ") t ORDER BY code"
+        "SELECT DISTINCT SUBSTRING_INDEX(ts_code, '.', 1) AS code, stock_name AS name"
+        " FROM la_pick WHERE eval_date = %s ORDER BY code",
+        (eval_date,)
     )
     rows = cur.fetchall()
     conn.close()
-    logger.info(f"[la_pick] 读取到 {len(rows)} 只股票")
-    return [(r[0], r[1]) for r in rows]
+    logger.info(f"[la_pick] eval_date={eval_date}，读取到 {len(rows)} 只股票")
+    return eval_date, [(r[0], r[1]) for r in rows]
 
 
 def main():
@@ -472,12 +496,15 @@ def main():
                 run_stocks(session, cfg.llm, codes_names, run=run)
 
         elif args.all_la:
-            codes_names = _load_la_stocks(cfg)
+            eval_date, codes_names = _load_la_stocks(cfg)
             if codes_names:
+                logger.info(f"[la模式] 分析日期: {eval_date}，共 {len(codes_names)} 只股票")
                 run = _start_or_resume_batch(session, len(codes_names),
                                              task_type="all_la",
-                                             force_new=args.no_resume)
-                run_stocks(session, cfg.llm, codes_names, run=run)
+                                             force_new=args.no_resume,
+                                             eval_date=str(eval_date))
+                run_stocks(session, cfg.llm, codes_names, run=run,
+                           analysis_date=eval_date)
 
         elif args.all:
             stocks = load_stocks(cfg)
