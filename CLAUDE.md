@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-股票舆情与热度研究系统。四个独立包：热度采集、新闻采集、股吧情绪、LLM分析。结果存入 MySQL，用于选股信号和相关性研究。
+股票舆情与热度研究系统。四个独立包（heat/news/guba/analysis）各自采集、分析、入库，结果存入 MySQL，用于选股信号和相关性研究。
 
 ## Commands
 
@@ -29,6 +29,8 @@ python -m analysis.main --global              # 国际形势
 python -m analysis.main --domestic            # 国内形势
 python -m analysis.main --stock 601789        # 个股基本面
 python -m analysis.main --all                 # 全部
+python -m analysis.main --all-la              # 选股池
+python -m analysis.main --retry               # 重跑失败
 ```
 
 ### 执行顺序约束
@@ -38,9 +40,33 @@ python -m analysis.main --all                 # 全部
 
 ## Architecture
 
+### 分层设计
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     调度层 (main.py)                      │
+│  间隔控制 · 并发管理 · 游标断点 · 入库编排 · 重试策略       │
+├─────────────────────────────────────────────────────────┤
+│                 能力层 (fetcher.py / analyzer.py)          │
+│  纯 HTTP/API 调用 · 数据解析 · LLM Prompt · 不关心调度     │
+├─────────────────────────────────────────────────────────┤
+│                  数据层 (database.py)                      │
+│  SQLAlchemy · batch_upsert · batch_insert_ignore · 幂等   │
+├─────────────────────────────────────────────────────────┤
+│                  配置层 (config.py)                        │
+│  config.yaml 加载 · AppConfig dataclass · stocks.txt 解析  │
+├─────────────────────────────────────────────────────────┤
+│                  网络层 (clash_proxy.py)                   │
+│  Clash API 节点轮换 · 测速筛选 · 最优选择 · 自动恢复       │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 包结构
+
 ```
 config.py         共享配置 + load_stocks
 database.py       共享 Base + Database + batch_upsert/insert_ignore
+clash_proxy.py    Clash 代理动态切换（节点轮换/测速/最优选择）
 
 heat/             热度包
   fetcher.py      能力层：popularity_page + akshare 接口
@@ -48,20 +74,39 @@ heat/             热度包
   main.py         调度层：1s间隔循环调用，入库
 
 news/             新闻包
-  fetcher.py      能力层：今日头条搜索（主）+ 搜狗（备），curl_cffi 绕反爬
+  fetcher.py      能力层：今日头条搜索，curl_cffi 绕反爬
   models.py       Article（url_hash 唯一去重）
-  main.py         调度层：1s间隔分批，入库
+  main.py         调度层：重试退避 + 20-30s 间隔限流
 
 guba/             股吧情绪
-  fetcher.py      能力层：股吧帖子抓取 + LLM 情绪分类
+  fetcher.py      能力层：股吧帖子抓取 + LLM 情绪分类 + 加权评分
   models.py       GubaSentiment + GubaPostDetail
-  main.py         调度层：单股/市场采样（4区间40只，并发LLM）
+  main.py         调度层：单股/市场采样/全市场（并发LLM，断点续跑）
 
 analysis/         LLM 分析
   analyzer.py     能力层：头条搜索 + LLM 分析（国际/国内/个股）
-  models.py       NewsAnalysis（三种类型：global/domestic/stock）
-  main.py         调度层
+  models.py       NewsAnalysis + AnalysisFailure + AnalysisRun
+  main.py         调度层：游标断点续跑 + 失败重试 + 并发LLM
 ```
+
+### 并发模型
+
+- **串行搜索 + 并发 LLM**：主线程按顺序发起 HTTP 请求（限流间隔），搜到数据后提交线程池做 LLM 分析
+- **Semaphore 控制上限**：analysis MAX_LLM_WORKERS=3，guba MAX_LLM_WORKERS=10
+- **滑动窗口收割**：主线程搜索新股时同步回收已完成的 LLM future，避免堆积
+
+### 断点续跑机制
+
+- `AnalysisRun` 表：run_id + 游标 + 失败数 + 来源标识
+- 中断后重跑自动从游标位置继续，`--no-resume` 强制新建
+- `AnalysisFailure` 表记录失败阶段和错误，`--retry` 重跑未解决的
+
+### 代理切换
+
+- `clash_proxy.py`：通过 Clash REST API 管理代理节点
+- 有序节点列表 + 游标轮换，测速不通过则跳过
+- analysis 搜索失败时自动轮换 IP + 重建 session
+- `restore_auto()` 恢复自动选择
 
 ## Database Tables
 
@@ -73,18 +118,20 @@ analysis/         LLM 分析
 | `articles` | news | 个股新闻文章，7 天滚动 |
 | `guba_sentiment` | guba | 股吧情绪得分（每日每股一条，百分制） |
 | `guba_post_detail` | guba | 股吧帖子明细 |
-| `news_analysis` | analysis | LLM 分析结果（国际/国内/个股，百分制） |
+| `news_analysis` | analysis | LLM 分析结果（国际/国内/个股，百分制多维评分） |
+| `analysis_failure` | analysis | 分析失败记录（断点续跑 + 失败重试） |
 
 ## Key Design Decisions
 
-- **能力层 vs 调度层**: fetcher.py 是纯接口调用，main.py 是调度编排（1s 间隔限流）
+- **能力层 vs 调度层**: fetcher.py 是纯接口调用（无限流），main.py 是调度编排（间隔控制 + 并发管理）
 - **包独立**: 每个包自带 models.py + main.py，可独立运行
 - **不使用事务**: 无 rollback，每次写入独立提交
-- **写入方法**: `database.batch_upsert()` / `batch_insert_ignore()`
-- **新闻搜索**: 今日头条优先，搜狗 fallback，curl_cffi + chrome120 指纹绕反爬
+- **写入方法**: `database.batch_upsert()` / `batch_insert_ignore()`，分批提交（500条/批）
+- **新闻搜索**: 今日头条，curl_cffi + chrome120 指纹绕反爬
 - **评分统一百分制**: 50 分中性，0-100 范围
 - **搜索关键词**: 公司名 + 项目/利润/前景，单词搜索更精准
 - **股吧并发**: Semaphore(10) 控制 LLM 并发，主线程顺序抓帖子
 - **stocks.txt**: 解析代码、公司名、行业，生成 StockInfo
 - HTTP 客户端: httpx（heat）/ curl_cffi（news/guba/analysis）
 - AkShare 用 requests，heat/main.py 临时禁用系统代理
+- **代理切换**: clash_proxy.py 通过 Clash REST API 动态切换代理节点，搜索失败自动轮换

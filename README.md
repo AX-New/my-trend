@@ -1,19 +1,46 @@
 # my-trend
 
-股票舆情与热度研究系统。四个独立包各自采集、分析、入库，结果存入 MySQL 用于选股信号和相关性研究。
+**股票舆情与热度研究系统** — 多维度采集 A 股市场情绪数据，结合 LLM 分析，输出结构化评分，用于选股信号和相关性研究。
+
+## 系统架构
+
+```
+                         ┌─────────────────────────────────────┐
+                         │           config.yaml               │
+                         │  (数据库 / LLM / 网络 / 调度参数)     │
+                         └──────────────┬──────────────────────┘
+                                        │
+              ┌─────────────┬───────────┼───────────┬─────────────┐
+              ▼             ▼           ▼           ▼             ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐
+        │  heat/   │ │  news/   │ │  guba/   │ │ analysis/│ │clash_proxy│
+        │ 热度采集  │ │ 新闻采集  │ │ 股吧情绪  │ │ LLM分析  │ │ 代理切换   │
+        └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └───────────┘
+             │            │            │            │
+             ▼            ▼            ▼            ▼
+        ┌─────────────────────────────────────────────────┐
+        │            database.py (SQLAlchemy)              │
+        │       batch_upsert / batch_insert_ignore         │
+        └──────────────────────┬──────────────────────────┘
+                               ▼
+                     ┌──────────────────┐
+                     │   MySQL (my_trend)│
+                     │     8 张数据表     │
+                     └──────────────────┘
+```
 
 ## 数据线
 
-| 数据线 | 包 | 数据源 | 范围 |
-|--------|----|--------|------|
-| 人气排名 | `heat` | 东方财富选股 API | 全市场 ~5500 只/天 |
-| 热度趋势 | `heat` | AkShare detail_em | 个股 366 天历史 |
-| 热门关键词 | `heat` | AkShare keyword_em | Top100 概念关联 |
-| 个股新闻 | `news` | 今日头条（主）+ 搜狗（备） | 自选股，7 天滚动 |
-| 股吧情绪 | `guba` | 股吧帖子 + LLM 分类 | 单股/市场采样/全市场 |
-| 国际形势 | `analysis` | 今日头条 → LLM 分析 | 全球经济/美联储等 |
-| 国内形势 | `analysis` | 今日头条 → LLM 分析 | A股政策/中国经济等 |
-| 个股基本面 | `analysis` | 今日头条 → LLM 多维评分 | 自选股/全量 la_pick |
+| 数据线 | 包 | 数据源 | 范围 | 频率 |
+|--------|----|--------|------|------|
+| 人气排名 | `heat` | 东方财富选股 API | 全市场 ~5500 只/天 | 日频 |
+| 热度趋势 | `heat` | AkShare detail_em | 个股 366 天历史 | 首次回溯 |
+| 热门关键词 | `heat` | AkShare keyword_em | Top100 概念关联 | 日频 |
+| 个股新闻 | `news` | 今日头条 | 自选股，7 天滚动 | 日频 |
+| 股吧情绪 | `guba` | 股吧帖子 + LLM 分类 | 单股/市场采样/全市场 | 日频 |
+| 国际形势 | `analysis` | 今日头条 → LLM 分析 | 全球经济/美联储等 | 日频 |
+| 国内形势 | `analysis` | 今日头条 → LLM 分析 | A股政策/中国经济等 | 日频 |
+| 个股基本面 | `analysis` | 今日头条 → LLM 多维评分 | 自选股/全量/选股池 | 日频 |
 
 ## 快速开始
 
@@ -58,7 +85,8 @@ python -m news.main --all-stocks              # 全部自选股
 python -m guba.main --stock 600519            # 单股情绪分析
 python -m guba.main --stock 600519,000858     # 多股
 python -m guba.main --market                  # 市场采样（4区间40只，并发LLM）
-python -m guba.main --all                     # 全市场（~5500只，分批100入库）
+python -m guba.main --all-stocks              # 全市场（~5500只，断点续跑）
+python -m guba.main --all-la                  # 选股池（la_pick，断点续跑）
 ```
 
 ### analysis — 基本面分析
@@ -69,8 +97,9 @@ python -m analysis.main --domestic            # 国内形势分析
 python -m analysis.main --stock 600519        # 个股基本面
 python -m analysis.main --stock 600519,000858 # 多只个股
 python -m analysis.main --all                 # 国际+国内+stocks.txt个股
-python -m analysis.main --all-stocks          # 国际+国内+la_pick全量个股
-python -m analysis.main --retry               # 重跑今天失败的股票
+python -m analysis.main --all-stocks          # 全量个股（stock_basic 全市场）
+python -m analysis.main --all-la              # 选股池（la_pick）
+python -m analysis.main --retry               # 重跑最近一次失败的股票
 python -m analysis.main --all-stocks --no-resume  # 强制全量重跑
 ```
 
@@ -90,10 +119,11 @@ python -m analysis.main --all    # 5. 基本面分析
 
 ```
 my-trend/
-├── config.py                # 共享配置 + load_stocks
-├── database.py              # 共享 Base + batch_upsert / batch_insert_ignore
-├── config.yaml              # 数据库 + LLM 配置
-├── stocks.txt               # 自选股票列表
+├── config.py                # 共享配置：AppConfig + load_stocks
+├── config.yaml              # 运行时配置（数据库/LLM/网络/调度参数）
+├── database.py              # 共享数据层：Base + Database + batch_upsert/insert_ignore
+├── clash_proxy.py           # Clash 代理动态切换（节点轮换/测速/最优选择）
+├── stocks.txt               # 自选股票列表（代码 + 公司名 + 行业）
 │
 ├── heat/                    # 热度包
 │   ├── fetcher.py           #   能力层：东财人气排名 + AkShare 3个接口
@@ -101,20 +131,21 @@ my-trend/
 │   └── main.py              #   调度层：人气排名 / 关键词 / 历史回溯
 │
 ├── news/                    # 新闻包
-│   ├── fetcher.py           #   能力层：今日头条（主）+ 搜狗（备），curl_cffi 绕反爬
+│   ├── fetcher.py           #   能力层：今日头条搜索，curl_cffi 绕反爬
 │   ├── models.py            #   Article（url_hash 去重）
-│   └── main.py              #   调度层：1s 间隔限流
+│   └── main.py              #   调度层：重试退避 + 20-30s 间隔限流
 │
-├── guba/                    # 股吧情绪包（独立）
+├── guba/                    # 股吧情绪包
 │   ├── fetcher.py           #   能力层：抓帖子 + LLM 情绪分类 + 加权评分
 │   ├── models.py            #   GubaSentiment + GubaPostDetail
-│   └── main.py              #   调度层：单股 / 市场采样 / 全市场（并发LLM）
+│   └── main.py              #   调度层：单股/市场采样/全市场（并发LLM，断点续跑）
 │
-├── analysis/                # 基本面分析包（独立）
-│   ├── analyzer.py          #   能力层：搜新闻 → LLM 多维评分（国际/国内/个股）
-│   ├── models.py            #   NewsAnalysis + AnalysisFailure
-│   └── main.py              #   调度层：断点续跑 + 失败重试 + 并发LLM
+├── analysis/                # 基本面分析包
+│   ├── analyzer.py          #   能力层：头条搜索 → LLM 多维评分（国际/国内/个股）
+│   ├── models.py            #   NewsAnalysis + AnalysisFailure + AnalysisRun
+│   └── main.py              #   调度层：游标断点续跑 + 失败重试 + 并发LLM
 │
+├── logs/                    # 运行日志（analysis 自动生成）
 └── task/                    # 任务文档
 ```
 
@@ -131,16 +162,46 @@ my-trend/
 | `news_analysis` | analysis | LLM 分析结果（国际/国内/个股，百分制多维评分） |
 | `analysis_failure` | analysis | 分析失败记录（断点续跑 + 失败重试） |
 
-## 设计原则
+## 核心设计
 
-- **能力层 vs 调度层**：`fetcher.py` 纯接口调用（无限流），`main.py` 调度编排（间隔控制 + 并发管理）
-- **包独立**：`analysis` 和 `guba` 完全独立，各自有 models + main，可单独运行
-- **并发模型**：主线程串行抓取（1s 限流），LLM 调用丢入线程池并发（Semaphore 控制上限）
-- **断点续跑**：`analysis` 通过查 DB 已完成记录跳过，中断后重跑自动续接
-- **失败追踪**：`analysis_failure` 表记录失败阶段和错误，`--retry` 重跑未解决的
-- **幂等写入**：MySQL upsert / INSERT IGNORE，重复运行安全
-- **统一评分**：百分制（0-100），50 为中性
+### 分层架构
+
+```
+fetcher.py / analyzer.py   能力层：纯 HTTP/API 调用，不关心调度和限流
+         ↓
+main.py                    调度层：间隔控制、并发管理、游标断点、入库编排
+         ↓
+database.py                数据层：batch_upsert / batch_insert_ignore，幂等写入
+```
+
+### 并发模型
+
+- **串行搜索 + 并发 LLM**：主线程按顺序发起 HTTP 请求（限流间隔），搜到数据后立即提交到线程池做 LLM 分析
+- **Semaphore 控制并发**：analysis 3 线程、guba 10 线程
+- **滑动窗口收割**：主线程搜索新股时，同步收割已完成的 LLM future
+
+### 断点续跑
+
+- `AnalysisRun` 表记录运行状态（run_id、游标、失败数）
+- 中断后重跑，自动从游标位置继续
+- `--no-resume` 强制新建 run
+
+### 反爬策略
+
+- **curl_cffi + chrome120 指纹**：绕过今日头条 TLS 指纹检测
+- **Clash 代理轮换**：搜索失败时自动切换节点，测速后选择可用节点
+- **自适应退避**：空结果按指数退避重试（20-30s 基准间隔）
+
+### 幂等写入
+
+- `batch_upsert()`：MySQL `ON DUPLICATE KEY UPDATE`，重复记录更新指定字段
+- `batch_insert_ignore()`：MySQL `INSERT IGNORE`，重复记录直接跳过
+- 分批提交（默认 500 条/批），中途崩溃不丢已提交数据
 
 ## 技术栈
 
-Python 3.11+ / SQLAlchemy / MySQL / curl_cffi / AkShare / OpenAI-compatible LLM（火山方舟 doubao-seed-2.0-pro）
+- **Python 3.11+** / SQLAlchemy / MySQL
+- **HTTP 客户端**：httpx（heat）、curl_cffi（news/guba/analysis）
+- **数据接口**：AkShare（热度趋势/关键词）、东方财富 API（人气排名）
+- **LLM**：OpenAI-compatible API（火山方舟 doubao-seed-2.0-pro）
+- **代理**：Clash REST API 动态切换节点
