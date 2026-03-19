@@ -12,6 +12,7 @@
 
 import argparse
 import logging
+import random
 import time
 from datetime import datetime
 
@@ -29,7 +30,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("heat.minute")
 
-DELAY = 1.5  # AkShare 限流间隔（秒）
+DELAY_MIN = 10  # AkShare 限流间隔下限（秒）
+DELAY_MAX = 15  # AkShare 限流间隔上限（秒）
 BATCH_SAVE = 50  # 每采集 N 只股票批量入库一次，防中途崩溃丢数据
 
 
@@ -121,7 +123,7 @@ def _fetch_and_save(session, stocks: list[tuple], today, today_str: str):
             )
             all_rows = []
 
-        time.sleep(DELAY)
+        time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
     # 剩余数据入库
     if all_rows:
