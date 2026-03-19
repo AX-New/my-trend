@@ -29,10 +29,24 @@ TOP_N = 20
 def run_analyze(session):
     """计算今日 vs 昨日排名变化，取 Top20 写入 heat_change_top"""
     start = time.time()
-    today = datetime.now().date()
     time_point = datetime.now().strftime("%H:%M")
 
-    # 查上一个有数据的交易日（不一定是昨天，可能跨周末）
+    # 用 popularity_rank 中最新日期作为"今天"
+    # 因为 heat.main 存的日期来自 API 的 MAX_TRADE_DATE，不一定等于 datetime.now()
+    today = session.execute(
+        text("SELECT MAX(date) FROM popularity_rank"),
+    ).scalar()
+
+    if not today:
+        logger.warning("[分析] popularity_rank 无数据")
+        return
+
+    today_count = session.execute(
+        text("SELECT COUNT(*) FROM popularity_rank WHERE date = :today"),
+        {"today": today},
+    ).scalar()
+
+    # 查上一个有数据的交易日
     last_date = session.execute(
         text("SELECT MAX(date) FROM popularity_rank WHERE date < :today"),
         {"today": today},
@@ -40,16 +54,6 @@ def run_analyze(session):
 
     if not last_date:
         logger.warning("[分析] 无历史数据可对比")
-        return
-
-    # 检查今日是否有数据
-    today_count = session.execute(
-        text("SELECT COUNT(*) FROM popularity_rank WHERE date = :today"),
-        {"today": today},
-    ).scalar()
-
-    if not today_count:
-        logger.warning("[分析] 今日尚无人气排名数据，跳过")
         return
 
     # 查询当天已入选的股票，后续排除

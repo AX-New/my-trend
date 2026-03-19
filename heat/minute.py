@@ -143,7 +143,14 @@ def run_minute(session, mode="default"):
         mode: "default"=heat_change_top, "top100"=人气Top100, "market"=合集
     """
     start = time.time()
-    today = datetime.now().date()
+
+    # 用 popularity_rank 中最新日期作为"今天"（与 heat.main 存储日期一致）
+    today = session.execute(
+        text("SELECT MAX(date) FROM popularity_rank"),
+    ).scalar()
+    if not today:
+        logger.warning("[分钟线] popularity_rank 无数据")
+        return
     today_str = today.strftime("%Y-%m-%d")
 
     # 收集目标股票列表
