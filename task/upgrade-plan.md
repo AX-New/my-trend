@@ -1,6 +1,6 @@
 # my-trend 升级计划
 
-> 状态: 已完成 | 创建: 2026-03-14 | 更新: 2026-03-16
+> 状态: 已完成 | 创建: 2026-03-14 | 更新: 2026-03-20
 
 ## 已完成
 
@@ -34,6 +34,31 @@
 | 国内形势 | `analysis.main --domestic` | 头条搜索A股政策/中国经济等 → LLM 分析 | ✅ |
 | 个股基本面 | `analysis.main --stock` | 头条搜索公司新闻 → LLM 综合评价 | ✅ |
 
+### industry 包 —— 行业分析（2026-03-19 新增）
+
+| 功能 | 命令 | 说明 | 状态 |
+|------|------|------|------|
+| 全部行业 | `industry.main` | 申万L1 31个行业，头条搜新闻 → 豆包LLM多维评分 | ✅ |
+| 单个行业 | `industry.main --name 煤炭` | 指定行业分析 | ✅ |
+| 腾讯云 crontab | 每日 0:00 | 凌晨全量扫描31个行业 | ✅ |
+
+### sector 包 —— 板块分析（2026-03-19 新增）
+
+| 功能 | 命令 | 说明 | 状态 |
+|------|------|------|------|
+| 全部板块 | `sector.main` | 东财dc_index BK0+BK1 ~1010个，头条搜新闻 → 豆包LLM多维评分 | ✅ |
+| 单个板块 | `sector.main --name 公用事业` | 指定板块分析 | ✅ |
+| 腾讯云 crontab | 每日 1:00 | 凌晨全量扫描~1010个板块 | ✅ |
+
+### 数据同步（my-stock sync_remote.py 扩展）
+
+| 上传表 | 时间列 | 说明 | 状态 |
+|--------|--------|------|------|
+| dc_index | trade_date | 东财板块列表（sector 依赖） | ✅ |
+| dc_concept | trade_date | 东财题材库 | ✅ |
+| sw_daily | trade_date | 申万行业行情（industry 依赖） | ✅ |
+| index_classify | 全量 | 申万行业分类（industry 依赖） | ✅ |
+
 ### 基础设施
 
 | 项目 | 状态 |
@@ -44,7 +69,7 @@
 | config.yaml 精简（删除 sources/akshare 配置） | ✅ |
 | 代码清理（删除备用接口和未使用表） | ✅ |
 
-## 数据表（7张）
+## 数据表（10张）
 
 | 表 | 包 | 说明 |
 |----|-----|------|
@@ -55,3 +80,6 @@
 | `guba_sentiment` | guba | 股吧情绪得分 |
 | `guba_post_detail` | guba | 股吧帖子明细 |
 | `news_analysis` | analysis | LLM 分析结果 |
+| `analysis_failure` | analysis | 分析失败记录 |
+| `industry_analysis` | industry | 申万行业逐行业 LLM 分析 |
+| `sector_analysis` | sector | 东财板块逐板块 LLM 分析 |
