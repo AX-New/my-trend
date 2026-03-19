@@ -70,10 +70,10 @@ class EmHotKeyword(Base):
 
 
 class HeatChangeTop(Base):
-    """盘中热度变化 Top20 快照
+    """盘中热度飙升股记录
 
-    每个时间点记录排名上升最多的 Top20 股票。
-    同一天有多个时间点快照，用于追踪盘中热度演变。
+    每个时间点找出排名上升最多的 Top20 新股票（排除当天已入选的），
+    每只股票每天只入选一次，time_point 记录首次入选时间。
     """
     __tablename__ = "heat_change_top"
 
@@ -81,20 +81,19 @@ class HeatChangeTop(Base):
     stock_code = Column(String(20), nullable=False, comment="股票代码")
     stock_name = Column(String(50), nullable=False, comment="股票名称")
     date = Column(Date, nullable=False, comment="交易日期")
-    time_point = Column(String(10), nullable=False, comment="快照时间点，如 09:30")
-    rank_today = Column(Integer, nullable=False, comment="当前排名")
+    time_point = Column(String(10), nullable=False, comment="入选时间点，如 09:30")
+    rank_today = Column(Integer, nullable=False, comment="入选时排名")
     rank_yesterday = Column(Integer, comment="昨日排名")
     rank_change = Column(Integer, comment="排名变化（正数=上升）")
-    new_price = Column(Float, comment="最新价")
-    change_rate = Column(Float, comment="涨跌幅%")
+    new_price = Column(Float, comment="入选时价格")
+    change_rate = Column(Float, comment="入选时涨跌幅%")
     volume_ratio = Column(Float, comment="量比")
     turnover_rate = Column(Float, comment="换手率%")
     created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
-        UniqueConstraint("stock_code", "date", "time_point",
-                         name="uq_hct_code_date_tp"),
-        Index("idx_hct_date_tp", "date", "time_point"),
+        UniqueConstraint("stock_code", "date", name="uq_hct_code_date"),
+        Index("idx_hct_date", "date"),
         Index("idx_hct_rank_change", "rank_change"),
     )
 

@@ -13,7 +13,7 @@ from datetime import datetime
 from sqlalchemy import text
 
 from config import load_config
-from database import Database, batch_upsert
+from database import Database, batch_upsert, batch_insert_ignore
 from heat.models import PopularityRank, HeatChangeTop
 
 logging.basicConfig(
@@ -52,14 +52,30 @@ def run_analyze(session):
         logger.warning("[分析] 今日尚无人气排名数据，跳过")
         return
 
+    # 查询当天已入选的股票，后续排除
+    existing = session.execute(
+        text("SELECT stock_code FROM heat_change_top WHERE date = :today"),
+        {"today": today},
+    ).fetchall()
+    existing_codes = {r[0] for r in existing}
+
     logger.info(
         f"[分析] 对比：今日 {today}（{today_count} 条）vs 昨日 {last_date}，"
-        f"时间点 {time_point}"
+        f"时间点 {time_point}，已入选 {len(existing_codes)} 只"
     )
 
-    # JOIN 今日和昨日排名，计算变化，取 Top20
+    # JOIN 今日和昨日排名，计算变化，排除已入选股票，取 Top20 新股
     # rank_change = 昨日排名 - 今日排名，正数表示排名上升（更受关注）
-    sql = text("""
+    if existing_codes:
+        # 动态构造 NOT IN 子句（参数化防注入）
+        placeholders = ",".join(f":ex_{i}" for i in range(len(existing_codes)))
+        exclude_clause = f"AND t.stock_code NOT IN ({placeholders})"
+        params = {f"ex_{i}": code for i, code in enumerate(existing_codes)}
+    else:
+        exclude_clause = ""
+        params = {}
+
+    sql = text(f"""
         SELECT
             t.stock_code, t.stock_name,
             t.`rank` AS rank_today,
@@ -72,15 +88,13 @@ def run_analyze(session):
         WHERE t.date = :today
           AND y.`rank` IS NOT NULL
           AND t.`rank` IS NOT NULL
+          {exclude_clause}
         ORDER BY rank_change DESC
         LIMIT :top_n
     """)
 
-    rows = session.execute(sql, {
-        "today": today,
-        "yesterday": last_date,
-        "top_n": TOP_N,
-    }).fetchall()
+    params.update({"today": today, "yesterday": last_date, "top_n": TOP_N})
+    rows = session.execute(sql, params).fetchall()
 
     if not rows:
         logger.warning("[分析] 无排名变化数据")
@@ -108,14 +122,14 @@ def run_analyze(session):
             "turnover_rate": r.turnover_rate,
         })
 
-    affected = batch_upsert(
-        session, HeatChangeTop, records,
-        update_cols=["stock_name", "rank_today", "rank_yesterday", "rank_change",
-                     "new_price", "change_rate", "volume_ratio", "turnover_rate"],
-    )
+    # insert_ignore: 每只股票每天只记录首次入选，重跑不覆盖
+    affected = batch_insert_ignore(session, HeatChangeTop, records)
 
     elapsed = time.time() - start
-    logger.info(f"[分析] 完成：{len(records)} 条，affected {affected}，耗时 {elapsed:.1f}s")
+    logger.info(
+        f"[分析] 完成：新增 {affected}/{len(records)} 条，"
+        f"当日累计 {len(existing_codes) + affected} 只，耗时 {elapsed:.1f}s"
+    )
 
 
 def main():
