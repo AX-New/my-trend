@@ -25,7 +25,7 @@
                                ▼
                      ┌──────────────────┐
                      │   MySQL (my_trend)│
-                     │     8 张数据表     │
+                     │    12 张数据表     │
                      └──────────────────┘
 ```
 
@@ -33,9 +33,11 @@
 
 | 数据线 | 包 | 数据源 | 范围 | 频率 |
 |--------|----|--------|------|------|
-| 人气排名 | `heat` | 东方财富选股 API | 全市场 ~5500 只/天 | 日频 |
+| 人气排名 | `heat` | 东方财富选股 API | 全市场 ~5500 只/天 | 盘中9次+收盘1次 |
 | 热度趋势 | `heat` | AkShare detail_em | 个股 366 天历史 | 首次回溯 |
 | 热门关键词 | `heat` | AkShare keyword_em | Top100 概念关联 | 日频 |
+| 热度飙升Top20 | `heat` | popularity_rank 对比 | 排名上升最多的新股 | 盘中9次（累积发现） |
+| 分钟K线 | `heat` | AkShare minute | 热度Top股票1分钟线 | 收盘后1次 |
 | 个股新闻 | `news` | 今日头条 | 自选股，7 天滚动 | 日频 |
 | 股吧情绪 | `guba` | 股吧帖子 + LLM 分类 | 单股/市场采样/全市场 | 日频 |
 | 国际形势 | `analysis` | 今日头条 → LLM 分析 | 全球经济/美联储等 | 日频 |
@@ -65,12 +67,16 @@ python -m analysis.main --all
 
 ## 命令行
 
-### heat — 热度采集
+### heat — 热度采集+分析
 
 ```bash
 python -m heat.main                    # 每日人气排名（全市场 ~5500 只）
 python -m heat.main --keyword          # Top100 热门关键词（依赖当日排名）
 python -m heat.main --init             # 首次回溯（366天历史趋势，~1.5h）
+python -m heat.analyze                 # 热度变化分析（对比昨日排名，取Top20新股）
+python -m heat.minute                  # 分钟K线（heat_change_top 入选股）
+python -m heat.minute --top100         # 分钟K线（人气排名 Top100）
+python -m heat.minute --market         # 分钟K线（Top100 + heat_change_top 合集）
 ```
 
 ### news — 新闻采集
@@ -122,16 +128,18 @@ python -m sector.main --name 公用事业      # 单个板块
 ### 日常运行顺序
 
 ```bash
-python -m heat.main              # 1. 人气排名
-python -m heat.main --keyword    # 2. 关键词（依赖步骤1的Top100）
-python -m news.main --all-stocks # 3. 新闻采集
-python -m guba.main --market     # 4. 股吧情绪采样
-python -m analysis.main --all    # 5. 基本面分析
-python -m industry.main          # 6. 行业分析（凌晨0点，31个）
-python -m sector.main            # 7. 板块分析（凌晨1点，~1000个）
+python -m heat.main              # 1. 人气排名（盘中9次 + 收盘1次）
+python -m heat.analyze           # 2. 热度变化Top20（盘中9次，每次找新股）
+python -m heat.main --keyword    # 3. 关键词（依赖步骤1的Top100）
+python -m heat.minute --market   # 4. 分钟K线（收盘后，Top100 + 热度Top 合集）
+python -m news.main --all-stocks # 5. 新闻采集
+python -m guba.main --market     # 6. 股吧情绪采样
+python -m analysis.main --all    # 7. 基本面分析
+python -m industry.main          # 8. 行业分析（凌晨0点，31个）
+python -m sector.main            # 9. 板块分析（凌晨1点，~1000个）
 ```
 
-> heat 日常必须串行：`heat.main` → `heat.main --keyword`，关键词依赖当日排名 Top100。`--init` 仅首次运行。
+> heat 日常串行：`heat.main` → `heat.analyze`（+10min）→ `heat.main --keyword`（收盘后）→ `heat.minute`（收盘后）。`--init` 仅首次运行。
 
 ## 项目结构
 
@@ -145,8 +153,10 @@ my-trend/
 │
 ├── heat/                    # 热度包
 │   ├── fetcher.py           #   能力层：东财人气排名 + AkShare 3个接口
-│   ├── models.py            #   PopularityRank + EmHotRankDetail + EmHotKeyword
-│   └── main.py              #   调度层：人气排名 / 关键词 / 历史回溯
+│   ├── models.py            #   PopularityRank/EmHotRankDetail/EmHotKeyword/HeatChangeTop/HeatStockMinute
+│   ├── main.py              #   调度层：人气排名 / 关键词 / 历史回溯
+│   ├── analyze.py           #   热度变化分析：对比昨日排名，累积发现Top20新股
+│   └── minute.py            #   分钟K线采集：收盘后采集热度Top股票1分钟线
 │
 ├── news/                    # 新闻包
 │   ├── fetcher.py           #   能力层：今日头条搜索，curl_cffi 绕反爬
@@ -177,13 +187,15 @@ my-trend/
 └── task/                    # 任务文档
 ```
 
-## 数据表（10 张）
+## 数据表（12 张）
 
 | 表 | 包 | 说明 |
 |----|-----|------|
 | `popularity_rank` | heat | 人气排名每日快照，全市场 ~5500 只 |
 | `em_hot_rank_detail` | heat | 个股历史趋势+粉丝 366 天 |
 | `em_hot_keyword` | heat | 个股热门关键词，Top100 概念关联 |
+| `heat_change_top` | heat | 盘中热度飙升Top20（每只股票每天只入选一次，记录入选时间） |
+| `heat_stock_minute` | heat | 热度Top股票1分钟K线（收盘后采集，用于回测） |
 | `articles` | news | 个股新闻文章，7 天滚动 |
 | `guba_sentiment` | guba | 股吧情绪得分（每日每股一条，百分制） |
 | `guba_post_detail` | guba | 股吧帖子明细（Top3 热门帖子） |
