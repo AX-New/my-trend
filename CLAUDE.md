@@ -31,6 +31,14 @@ python -m analysis.main --stock 601789        # 个股基本面
 python -m analysis.main --all                 # 全部
 python -m analysis.main --all-la              # 选股池
 python -m analysis.main --retry               # 重跑失败
+
+# 行业分析（申万一级31个行业）
+python -m industry.main                       # 全部行业
+python -m industry.main --name 煤炭            # 单个行业
+
+# 板块分析（东财板块 BK0+BK1 ~1000个）
+python -m sector.main                         # 全部板块
+python -m sector.main --name 公用事业           # 单个板块
 ```
 
 ### 执行顺序约束
@@ -87,6 +95,16 @@ analysis/         LLM 分析
   analyzer.py     能力层：头条搜索 + LLM 分析（国际/国内/个股）
   models.py       NewsAnalysis + AnalysisFailure + AnalysisRun
   main.py         调度层：游标断点续跑 + 失败重试 + 并发LLM
+
+industry/         行业分析
+  analyzer.py     能力层：头条搜索 + LLM 行业多维评分
+  models.py       IndustryAnalysis
+  main.py         调度层：31个申万行业逐个分析，并发LLM
+
+sector/           板块分析
+  analyzer.py     能力层：头条搜索 + LLM 板块多维评分
+  models.py       SectorAnalysis
+  main.py         调度层：~1000个东财板块逐个分析，并发LLM
 ```
 
 ### 并发模型
@@ -120,6 +138,8 @@ analysis/         LLM 分析
 | `guba_post_detail` | guba | 股吧帖子明细 |
 | `news_analysis` | analysis | LLM 分析结果（国际/国内/个股，百分制多维评分） |
 | `analysis_failure` | analysis | 分析失败记录（断点续跑 + 失败重试） |
+| `industry_analysis` | industry | 申万行业逐行业 LLM 分析（每行业每日一条） |
+| `sector_analysis` | sector | 东财板块逐板块 LLM 分析（每板块每日一条） |
 
 ## Key Design Decisions
 
