@@ -20,7 +20,6 @@ from datetime import datetime
 from config import load_config
 from database import Database, batch_upsert, batch_insert_ignore
 from hot.models import IntradayHeatSnapshot, SectorNews
-from heat.models import HeatChangeTop
 from hot.fetcher import (
     fetch_realtime_hot_rank,
     fetch_sector_list,
@@ -109,36 +108,15 @@ def run_heat_snapshot(session, top_n: int = 200):
     elapsed = time.time() - start
     logger.info(f"[热度快照] 完成: {len(rows)} 条, affected {affected}, 耗时 {elapsed:.1f}s")
 
-    # 5. 输出热度飙升信号 + 写入 heat_change_top
+    # 5. 输出热度飙升信号
     if alerts:
-        alerts_sorted = sorted(alerts, key=lambda x: x["rank_change"], reverse=True)
-        logger.info(f"[热度快照] ===== 热度飙升信号 ({len(alerts_sorted)} 只) =====")
-
-        today = now.date()
-        hct_records = []
-        for a in alerts_sorted:
+        logger.info(f"[热度快照] ===== 热度飙升信号 ({len(alerts)} 只) =====")
+        for a in sorted(alerts, key=lambda x: x["rank_change"], reverse=True):
             logger.info(
                 f"  {a['stock_code']} {a['stock_name']} "
                 f"排名: {a['prev_rank']}→{a['rank']}(+{a['rank_change']}) "
                 f"涨幅: {a['change_rate']:.1f}%"
             )
-            hct_records.append({
-                "stock_code": a["stock_code"],
-                "stock_name": a["stock_name"],
-                "date": today,
-                "time_point": snapshot_time.strftime("%H:%M"),
-                "rank_today": a["rank"],
-                "rank_yesterday": a["prev_rank"],
-                "rank_change": a["rank_change"],
-                "new_price": a["new_price"],
-                "change_rate": a["change_rate"],
-                "volume_ratio": None,
-                "turnover_rate": None,
-            })
-
-        # insert_ignore: 每只股票每天只记录首次入选，重跑不覆盖
-        hct_affected = batch_insert_ignore(session, HeatChangeTop, hct_records)
-        logger.info(f"[热度快照] 信号入库: {hct_affected}/{len(hct_records)} 条写入 heat_change_top")
     else:
         logger.info("[热度快照] 本次无热度飙升信号")
 
