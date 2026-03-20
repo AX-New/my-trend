@@ -82,6 +82,7 @@
 
 | 项目 | 状态 |
 |------|------|
+| 交易日历 trading_day.py（AkShare实时，所有模块非交易日跳过） | ✅ |
 | 包拆分（heat/news/guba/analysis） | ✅ |
 | 无事务写入（batch_upsert / batch_insert_ignore） | ✅ |
 | 统一百分制评分（50分中性，0-100） | ✅ |
