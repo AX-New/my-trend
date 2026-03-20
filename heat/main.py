@@ -334,6 +334,11 @@ def main():
 
     orig = _disable_proxy()
     try:
+        from trading_day import is_trading_day
+        if not is_trading_day() and not args.init:
+            logger.info("========== 非交易日，跳过热度采集 ==========")
+            return
+
         if args.init:
             logger.info("========== 热度回溯开始 ==========")
             run_init(session)

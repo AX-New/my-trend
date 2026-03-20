@@ -131,6 +131,10 @@ def main():
     session = db.get_session()
 
     try:
+        from trading_day import is_trading_day
+        if not is_trading_day():
+            logger.info("========== 非交易日，跳过盘中排名采集 ==========")
+            return
         logger.info("========== 盘中排名采集开始 ==========")
         run(session, cfg)
         logger.info("========== 盘中排名采集完成 ==========")

@@ -188,6 +188,11 @@ def main():
     session = db.get_session()
 
     try:
+        from trading_day import is_trading_day
+        if not is_trading_day():
+            logger.info("========== 非交易日，跳过盘中热度监控 ==========")
+            return
+
         if args.sector and not args.all:
             # 只采集板块新闻
             logger.info("========== 板块新闻采集开始 ==========")

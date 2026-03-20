@@ -159,6 +159,10 @@ def main():
     session = db.get_session()
 
     try:
+        from trading_day import is_trading_day
+        if not is_trading_day():
+            logger.info("========== 非交易日，跳过盘中热度分析 ==========")
+            return
         logger.info("========== 盘中热度分析开始 ==========")
         run(session)
         logger.info("========== 盘中热度分析完成 ==========")
