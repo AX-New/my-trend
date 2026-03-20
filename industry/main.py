@@ -45,7 +45,7 @@ MAX_LLM_WORKERS = 3
 
 # my_stock 数据库（读取行业列表）
 MY_STOCK_DB = {
-    "host": "127.0.0.1", "port": 3307,
+    "host": "127.0.0.1", "port": 3306,
     "user": "root", "password": "root",
     "db": "my_stock", "charset": "utf8mb4",
 }
