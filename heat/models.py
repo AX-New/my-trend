@@ -123,3 +123,31 @@ class HeatStockMinute(Base):
         Index("idx_hsm_date", "trade_date"),
         Index("idx_hsm_code", "stock_code"),
     )
+
+
+class PopularityRankLive(Base):
+    """盘中实时人气排名（每次采集全量覆盖，物理隔离于 popularity_rank）
+
+    盘中 heat.main 写入此表，heat.analyze 从此表读取"今日"数据，
+    与 popularity_rank 中"昨日"数据做 dict 匹配计算 rank_change。
+    收盘后 17:00 的采集仍写入 popularity_rank 作为每日快照。
+    """
+    __tablename__ = "popularity_rank_live"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_code = Column(String(20), nullable=False)
+    stock_name = Column(String(50), nullable=False)
+    date = Column(Date, nullable=False, comment="交易日期（datetime.now）")
+    rank = Column(Integer, nullable=False, comment="人气排名")
+    new_price = Column(Float, comment="最新价")
+    change_rate = Column(Float, comment="涨跌幅%")
+    volume_ratio = Column(Float, comment="量比")
+    turnover_rate = Column(Float, comment="换手率%")
+    volume = Column(Integer, comment="成交量")
+    deal_amount = Column(Float, comment="成交额")
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint("stock_code", name="uq_prl_stock"),
+        Index("idx_prl_rank", "rank"),
+    )
