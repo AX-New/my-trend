@@ -60,6 +60,8 @@ def run(session):
         }
 
     # ── 2. 读取 popularity_rank 最新日期（昨日收盘快照） ──
+    # 若 MAX(date) == today（heat.main 17:00 已写入当日快照），则取前一交易日，
+    # 避免今天 vs 今天比较导致 rank_change 趋近于 0
     last_date = session.execute(
         text("SELECT MAX(date) FROM popularity_rank"),
     ).scalar()
@@ -67,6 +69,18 @@ def run(session):
     if not last_date:
         logger.warning("[分析] popularity_rank 无历史数据")
         return
+
+    if last_date == today:
+        prev_date = session.execute(
+            text("SELECT MAX(date) FROM popularity_rank WHERE date < :today"),
+            {"today": today},
+        ).scalar()
+        if prev_date:
+            logger.info(f"[分析] MAX(date)=今日，回退用前一日 {prev_date} 作为对比基准")
+            last_date = prev_date
+        else:
+            logger.warning("[分析] 无前一日数据可对比")
+            return
 
     yesterday_rows = session.execute(
         text("SELECT stock_code, `rank` FROM popularity_rank WHERE date = :d"),
