@@ -50,6 +50,25 @@
 | 单个板块 | `sector.main --name 公用事业` | 指定板块分析 | ✅ |
 | 腾讯云 crontab | 每日 1:00 | 凌晨全量扫描~1010个板块 | ✅ |
 
+### heat_live 包 —— 盘中全市场排名+Top20分析（2026-03-20 新增）
+
+| 功能 | 命令 | 说明 | 状态 |
+|------|------|------|------|
+| 盘中排名采集 | `heat_live.main` | 全市场~5500只 → popularity_rank_live（TRUNCATE覆盖） | ✅ |
+| Top20分析 | `heat_live.analyze` | 读live表+popularity_rank，dict匹配 → heat_change_top | ✅ |
+| 腾讯云 crontab | 盘中8次+10min | 物理隔离，datetime.now()避免API日期滞后 | ✅ |
+
+> **拆分原因**：东方财富 API 的 MAX_TRADE_DATE 在盘中返回昨日日期，原 heat.main 盘中采集会覆盖 popularity_rank 中昨日数据。heat_live 写独立的 live 表，物理隔离。
+
+### hot 包 —— 盘中Top100监控+板块新闻（2026-03-20 恢复）
+
+| 功能 | 命令 | 说明 | 状态 |
+|------|------|------|------|
+| Top100快照 | `hot.main` | AkShare stock_hot_rank_em → intraday_heat_snapshot | ✅ |
+| 板块新闻 | `hot.main --sector` | 涨幅前20板块新闻 → sector_news | ✅ |
+| 全部执行 | `hot.main --all` | 快照+新闻 | ✅ |
+| 腾讯云 crontab | 盘中8次 | 与 heat_live 并行，独立数据源 | ✅ |
+
 ### 数据同步（my-stock sync_remote.py 扩展）
 
 | 上传表 | 时间列 | 说明 | 状态 |
@@ -69,13 +88,18 @@
 | config.yaml 精简（删除 sources/akshare 配置） | ✅ |
 | 代码清理（删除备用接口和未使用表） | ✅ |
 
-## 数据表（10张）
+## 数据表（15张）
 
 | 表 | 包 | 说明 |
 |----|-----|------|
-| `popularity_rank` | heat | 人气排名每日快照 |
+| `popularity_rank` | heat | 人气排名日快照（收盘后） |
+| `popularity_rank_live` | heat_live | 盘中实时排名（TRUNCATE覆盖） |
 | `em_hot_rank_detail` | heat | 个股历史趋势+粉丝 366 天 |
 | `em_hot_keyword` | heat | 个股热门关键词 |
+| `heat_change_top` | heat_live | 盘中热度飙升Top20 |
+| `heat_stock_minute` | heat | 热度Top股票1分钟K线 |
+| `intraday_heat_snapshot` | hot | Top100盘中快照（带时间维度） |
+| `sector_news` | hot | 板块实时新闻 |
 | `articles` | news | 个股新闻文章，7 天滚动 |
 | `guba_sentiment` | guba | 股吧情绪得分 |
 | `guba_post_detail` | guba | 股吧帖子明细 |

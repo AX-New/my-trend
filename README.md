@@ -25,7 +25,7 @@
                                ▼
                      ┌──────────────────┐
                      │   MySQL (my_trend)│
-                     │    12 张数据表     │
+                     │    15 张数据表     │
                      └──────────────────┘
 ```
 
@@ -33,10 +33,13 @@
 
 | 数据线 | 包 | 数据源 | 范围 | 频率 |
 |--------|----|--------|------|------|
-| 人气排名 | `heat` | 东方财富选股 API | 全市场 ~5500 只/天 | 盘中9次+收盘1次 |
+| 人气排名(日快照) | `heat` | 东方财富分页 API | 全市场 ~5500 只/天 | 收盘后17:00 |
+| 人气排名(盘中) | `heat_live` | 东方财富分页 API | 全市场 ~5500 只 → live表 | 盘中8次(TRUNCATE覆盖) |
+| 热度飙升Top20 | `heat_live` | live表 vs popularity_rank | 排名上升最多的新股 | 盘中8次（dict匹配） |
+| Top100热门快照 | `hot` | AkShare stock_hot_rank_em | Top100热门股 | 盘中8次(带时间维度) |
+| 板块新闻 | `hot` | AkShare 板块资讯 | 涨幅前20板块 | 盘中8次 |
 | 热度趋势 | `heat` | AkShare detail_em | 个股 366 天历史 | 首次回溯 |
 | 热门关键词 | `heat` | AkShare keyword_em | Top100 概念关联 | 日频 |
-| 热度飙升Top20 | `heat` | popularity_rank 对比 | 排名上升最多的新股 | 盘中9次（累积发现） |
 | 分钟K线 | `heat` | AkShare minute | 热度Top股票1分钟线 | 收盘后1次 |
 | 个股新闻 | `news` | 今日头条 | 自选股，7 天滚动 | 日频 |
 | 股吧情绪 | `guba` | 股吧帖子 + LLM 分类 | 单股/市场采样/全市场 | 日频 |
@@ -67,16 +70,33 @@ python -m analysis.main --all
 
 ## 命令行
 
-### heat — 热度采集+分析
+### heat — 收盘后热度采集
 
 ```bash
-python -m heat.main                    # 每日人气排名（全市场 ~5500 只）
+python -m heat.main                    # 人气排名日快照（收盘后，全市场 ~5500 只）
 python -m heat.main --keyword          # Top100 热门关键词（依赖当日排名）
 python -m heat.main --init             # 首次回溯（366天历史趋势，~1.5h）
-python -m heat.analyze                 # 热度变化分析（对比昨日排名，取Top20新股）
 python -m heat.minute                  # 分钟K线（heat_change_top 入选股）
 python -m heat.minute --top100         # 分钟K线（人气排名 Top100）
 python -m heat.minute --market         # 分钟K线（Top100 + heat_change_top 合集）
+```
+
+### heat_live — 盘中全市场排名+Top20分析
+
+```bash
+python -m heat_live.main               # 全市场排名 → popularity_rank_live（TRUNCATE覆盖）
+python -m heat_live.analyze            # 读 live表 vs popularity_rank，dict匹配 → heat_change_top
+```
+
+> **为什么分 heat 和 heat_live？** 东方财富 API 的 MAX_TRADE_DATE 在盘中返回昨日日期，直接写 popularity_rank 会覆盖昨日数据。heat_live 写独立的 live 表（datetime.now() 为日期），物理隔离避免污染。
+
+### hot — 盘中Top100监控+板块新闻
+
+```bash
+python -m hot.main                     # Top100 热门股快照（默认前200）
+python -m hot.main --sector            # 板块新闻（涨幅前20板块）
+python -m hot.main --all               # 全部执行
+python -m hot.main --top 100           # 指定采集前N名
 ```
 
 ### news — 新闻采集
@@ -128,18 +148,21 @@ python -m sector.main --name 公用事业      # 单个板块
 ### 日常运行顺序
 
 ```bash
-python -m heat.main              # 1. 人气排名（盘中9次 + 收盘1次）
-python -m heat.analyze           # 2. 热度变化Top20（盘中9次，每次找新股）
-python -m heat.main --keyword    # 3. 关键词（依赖步骤1的Top100）
-python -m heat.minute --market   # 4. 分钟K线（收盘后，Top100 + 热度Top 合集）
-python -m news.main --all-stocks # 5. 新闻采集
-python -m guba.main --market     # 6. 股吧情绪采样
-python -m analysis.main --all    # 7. 基本面分析
-python -m industry.main          # 8. 行业分析（凌晨0点，31个）
-python -m sector.main            # 9. 板块分析（凌晨1点，~1000个）
-```
+# ── 盘中（8个时间点，crontab 工作日自动调度） ──
+python -m heat_live.main         # 1. 全市场排名 → live表
+python -m heat_live.analyze      # 2. Top20飙升分析（+10min，dict匹配）
+python -m hot.main --all         # 3. Top100快照 + 板块新闻（+5min）
 
-> heat 日常串行：`heat.main` → `heat.analyze`（+10min）→ `heat.main --keyword`（收盘后）→ `heat.minute`（收盘后）。`--init` 仅首次运行。
+# ── 收盘后 ──
+python -m heat.main              # 4. 人气排名日快照（17:00）
+python -m heat.minute --market   # 5. 分钟K线（17:20）
+python -m heat.main --keyword    # 6. 关键词（19:30）
+python -m news.main --all-stocks # 7. 新闻采集
+python -m guba.main --market     # 8. 股吧情绪采样
+python -m analysis.main --all    # 9. 基本面分析
+python -m industry.main          # 10. 行业分析（凌晨0点）
+python -m sector.main            # 11. 板块分析（凌晨1点）
+```
 
 ## 项目结构
 
@@ -151,12 +174,21 @@ my-trend/
 ├── clash_proxy.py           # Clash 代理动态切换（节点轮换/测速/最优选择）
 ├── stocks.txt               # 自选股票列表（代码 + 公司名 + 行业）
 │
-├── heat/                    # 热度包
-│   ├── fetcher.py           #   能力层：东财人气排名 + AkShare 3个接口
-│   ├── models.py            #   PopularityRank/EmHotRankDetail/EmHotKeyword/HeatChangeTop/HeatStockMinute
-│   ├── main.py              #   调度层：人气排名 / 关键词 / 历史回溯
-│   ├── analyze.py           #   热度变化分析：对比昨日排名，累积发现Top20新股
+├── heat/                    # 收盘后热度包
+│   ├── fetcher.py           #   能力层：东财人气排名分页API + AkShare 3个接口
+│   ├── models.py            #   PopularityRank/PopularityRankLive/EmHotRankDetail/EmHotKeyword/HeatChangeTop/HeatStockMinute
+│   ├── main.py              #   调度层：收盘后人气排名日快照 / 关键词 / 历史回溯
+│   ├── analyze.py           #   (旧版，已由 heat_live.analyze 替代)
 │   └── minute.py            #   分钟K线采集：收盘后采集热度Top股票1分钟线
+│
+├── heat_live/               # 盘中全市场排名包（物理隔离，避免覆盖日快照）
+│   ├── main.py              #   全市场排名 → popularity_rank_live（TRUNCATE + INSERT）
+│   └── analyze.py           #   读 live表 + popularity_rank，dict匹配 → heat_change_top
+│
+├── hot/                     # 盘中Top100监控 + 板块新闻
+│   ├── fetcher.py           #   能力层：AkShare stock_hot_rank_em + 板块资讯
+│   ├── models.py            #   IntradayHeatSnapshot / SectorNews
+│   └── main.py              #   调度层：Top100快照(带时间维度) + 板块新闻
 │
 ├── news/                    # 新闻包
 │   ├── fetcher.py           #   能力层：今日头条搜索，curl_cffi 绕反爬
@@ -187,15 +219,18 @@ my-trend/
 └── task/                    # 任务文档
 ```
 
-## 数据表（12 张）
+## 数据表（15 张）
 
 | 表 | 包 | 说明 |
 |----|-----|------|
-| `popularity_rank` | heat | 人气排名每日快照，全市场 ~5500 只 |
+| `popularity_rank` | heat | 人气排名每日快照（收盘后），全市场 ~5500 只 |
+| `popularity_rank_live` | heat_live | 盘中实时排名（每次TRUNCATE覆盖），全市场 ~5500 只 |
 | `em_hot_rank_detail` | heat | 个股历史趋势+粉丝 366 天 |
 | `em_hot_keyword` | heat | 个股热门关键词，Top100 概念关联 |
-| `heat_change_top` | heat | 盘中热度飙升Top20（每只股票每天只入选一次，记录入选时间） |
+| `heat_change_top` | heat_live | 盘中热度飙升Top20（dict匹配live表vs日快照，每只股票每天只入选一次） |
 | `heat_stock_minute` | heat | 热度Top股票1分钟K线（收盘后采集，用于回测） |
+| `intraday_heat_snapshot` | hot | Top100盘中快照（每个时间点独立记录，含rank_change） |
+| `sector_news` | hot | 板块实时新闻（涨幅前20板块，content_hash去重） |
 | `articles` | news | 个股新闻文章，7 天滚动 |
 | `guba_sentiment` | guba | 股吧情绪得分（每日每股一条，百分制） |
 | `guba_post_detail` | guba | 股吧帖子明细（Top3 热门帖子） |
